@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Author: Pandiyaraj Karuppasamy -->
+<!-- Date: Oct-17-2026 -->
+<!-- Modified: Oct-17-2026 (live alerts: notifications, foreground service, exact alarms) -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <!-- Live alerts. Notifications are asked for in the same tap that turns alerts on. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <!-- Keeps the one-minute poll on time with the screen off, only while a match is followed. -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- An exact alarm at kick-off is what may start the foreground service from the background.
+         USE_EXACT_ALARM from Android 13; SCHEDULE_EXACT_ALARM is the Android 12 form. -->
+    <uses-permission android:name="android.permission.USE_EXACT_ALARM" />
+    <uses-permission
+        android:name="android.permission.SCHEDULE_EXACT_ALARM"
+        android:maxSdkVersion="32" />
+    <!-- Lets the Settings screen offer the battery optimisation exemption that keeps alerts on time. -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+
+    <application
+        android:name=".SportsHubApp"
+        android:allowBackup="false"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.SportsHub">
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTop"
+            android:windowSoftInputMode="adjustResize">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <service
+            android:name=".alerts.LiveAlertService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Live score alerts while a match the user follows is in play" />
+        </service>
+
+        <receiver
+            android:name=".alerts.AlertReceiver"
+            android:exported="false" />
+    </application>
+</manifest>

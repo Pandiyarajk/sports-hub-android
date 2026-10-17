@@ -1,0 +1,43 @@
+# Build output
+.gradle/
+build/
+app/build/
+captures/
+.cxx/
+*.apk
+*.aab
+*.ap_
+*.dex
+
+# Contains the absolute SDK path, so it differs per machine and must never be committed
+local.properties
+
+# IDE
+.idea/
+*.iml
+*.ipr
+*.iws
+.kotlin/
+
+# Signing material. A leaked keystore lets anyone ship an update as you, and a lost one
+# means no future build can update an already-installed copy.
+*.jks
+*.keystore
+keystore.properties
+key.properties
+
+# Profiling and crash dumps
+*.hprof
+*.log
+
+.DS_Store
+Thumbs.db
+
+# Temporary files
+SCRATCHPAD.md
+scratchpad/
+
+# Hub-synced local files (kept on disk, not published)
+.cursor/
+.hub-manifest.json
+CLAUDE.md
