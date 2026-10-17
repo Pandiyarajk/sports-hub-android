@@ -141,6 +141,36 @@ class CricketAlertTest {
     }
 
     @Test
+    fun `batting second, every over alert is a chase update`() {
+        // BAN v ZIM, Oct-17-2026: Bangladesh chasing 272.
+        fun bat(runs: Int, wkts: Int, overs: String) = Batting(
+            "BAN", 2, runs, wkts, overs.substringBefore('.').toInt(), overs, "$runs/$wkts ($overs/50 ov, target 272)",
+        )
+        fun live(b: Batting) = CricketLive("bz", "BAN v ZIM", MatchState.LIVE, "Bangladesh require ${272 - b.runs} runs", b, null)
+        val over = AlertEngine.cricket(live(bat(46, 0, "6")), live(bat(52, 0, "7")), everyOver = true).single()
+        assertEquals(AlertKind.OVER, over.kind)
+        assertEquals("End of over 7: BAN 52/0 (7/50 ov, target 272)", over.title)
+        assertEquals("6 runs in the over · Need 220 from 258 balls · RRR 5.11", over.text)
+
+        // Mid-over previous poll: the current rate is labelled CRR beside the required one.
+        val rated = AlertEngine.cricket(live(bat(48, 0, "6.3")), live(bat(52, 0, "7")), everyOver = true).single()
+        assertTrue(rated.text.startsWith("CRR 7.42 · Need 220"))
+
+        // A wicket in the chase carries the same line.
+        val wicket = AlertEngine.cricket(live(bat(52, 0, "7")), live(bat(53, 1, "7.2")), everyOver = true).single()
+        assertEquals(AlertKind.WICKET, wicket.kind)
+        assertEquals("Need 219 from 256 balls · RRR 5.13", wicket.text)
+    }
+
+    @Test
+    fun `no chase line batting first or once the target is reached`() {
+        assertEquals(null, AlertEngine.chaseUpdate(Batting("ZIM", 1, 120, 2, 20, "20", "120/2 (20/50 ov)")))
+        assertEquals(null, AlertEngine.chaseUpdate(Batting("BAN", 2, 272, 5, 45, "45", "272/5 (45/50 ov, target 272)")))
+        // Rain-reduced chase: 9 overs a side.
+        assertEquals("Need 20 from 9 balls · RRR 13.33", AlertEngine.chaseUpdate(Batting("WI", 2, 70, 3, 7, "7.3", "70/3 (7.3/9 ov, target 90)")))
+    }
+
+    @Test
     fun `the toss line is left out of overs and wickets once play has started`() {
         // Live, Oct-17-2026: the over 1 alert read "West Indies won toss & fielded".
         val toss = "West Indies won toss & fielded"

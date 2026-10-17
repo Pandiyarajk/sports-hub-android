@@ -66,15 +66,33 @@ object AlertEngine {
             return out
         }
 
+        // Batting second, every over and every wicket is a chase update: what is needed, from how
+        // many balls, at what rate. It replaces the feed's status line, which says the same less.
+        val chase = chaseUpdate(b)
         val fell = b.wickets - p.wickets
-        if (fell > 0) out += wicket(fell, score, news, now.matchId)
+        if (fell > 0) out += wicket(fell, score, chase ?: news, now.matchId)
 
         val overs = b.oversDone - p.oversDone
         if (overs > 0 && everyOver) {
             val which = if (overs == 1) "End of over ${b.oversDone}" else "Overs ${p.oversDone + 1}-${b.oversDone}"
-            out += alert(AlertKind.OVER, "$which: $score", listOf(overLine(p, b), news).filter { it.isNotBlank() }.joinToString(" · "))
+            out += alert(AlertKind.OVER, "$which: $score", listOf(overLine(p, b, chase != null), chase ?: news).filter { !it.isNullOrBlank() }.joinToString(" · "))
         }
         return out
+    }
+
+    /**
+     * "Need 220 from 258 balls · RRR 5.11" when this side is chasing, read from the feed's own score
+     * string "52/0 (7/50 ov, target 272)", so a rain-reduced limit counts. Null when not chasing,
+     * and once the target is reached (the result alert says that).
+     */
+    internal fun chaseUpdate(b: Batting): String? {
+        val m = Regex("""\((\d+)(?:\.(\d))?/(\d+) ov, target (\d+)\)""").find(b.scoreText) ?: return null
+        val bowled = m.groupValues[1].toInt() * 6 + (m.groupValues[2].toIntOrNull() ?: 0)
+        val left = m.groupValues[3].toInt() * 6 - bowled
+        val need = m.groupValues[4].toInt() - b.runs
+        if (need <= 0 || left <= 0) return null
+        val rate = com.pandiyarajk.sportshub.data.cricket.twoPlaces(need * 6.0 / left)
+        return "Need $need from $left ball${if (left == 1) "" else "s"} · RRR $rate"
     }
 
     /** The status line unless it is still the toss ("West Indies won toss & fielded"). */
@@ -97,7 +115,7 @@ object AlertEngine {
      * difference since the last poll includes balls of the previous over (measured live: an over
      * of 14 reported as "1 run"), so the run rate is shown instead, which is always right.
      */
-    internal fun overLine(p: Batting, b: Batting): String {
+    internal fun overLine(p: Batting, b: Batting, chasing: Boolean = false): String {
         val atBoundary = '.' !in b.oversText
         val runsInOver = when {
             b.oversDone - p.oversDone != 1 || !atBoundary -> null
@@ -108,7 +126,8 @@ object AlertEngine {
         if (runsInOver != null) return "$runsInOver run${if (runsInOver == 1) "" else "s"} in the over"
         val balls = com.pandiyarajk.sportshub.data.cricket.oversToBalls(b.oversText) ?: return ""
         if (balls == 0) return ""
-        return "RR " + com.pandiyarajk.sportshub.data.cricket.twoPlaces(b.runs * 6.0 / balls)
+        // Beside a required rate, "CRR" says which rate this one is.
+        return (if (chasing) "CRR " else "RR ") + com.pandiyarajk.sportshub.data.cricket.twoPlaces(b.runs * 6.0 / balls)
     }
 
     fun football(prev: FootballLive?, now: FootballLive): List<Alert> {
