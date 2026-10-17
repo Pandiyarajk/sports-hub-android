@@ -65,10 +65,10 @@ object AlertScheduler {
         var liveNow = false
         val starts = mutableListOf<Long>()
 
-        if (settings.cricketAlerts) {
+        if (settings.anyCricket) {
             runCatchingNonCancel {
                 parseCricketHeader(container.fetch(get(CricketRepository.HEADER_URL)))
-                    .filter { it.isIndia && it.id !in settings.mutedMatches }
+                    .filter { followsCricket(settings, it.id, it.isIndia) }
                     .forEach { m ->
                         when (m.state) {
                             MatchState.LIVE -> liveNow = true
@@ -95,6 +95,10 @@ object AlertScheduler {
         val next = starts.filter { it > now }.minOrNull()
         if (next != null) setAlarm(context, next, REQUEST_NEXT) else cancelAlarm(context, REQUEST_NEXT)
     }
+
+    /** India matches when India alerts are on, plus any match followed with its bell; never a muted one. */
+    fun followsCricket(settings: AppSettings, matchId: String, isIndia: Boolean): Boolean =
+        matchId !in settings.mutedMatches && ((settings.cricketAlerts && isIndia) || matchId in settings.followedMatches)
 
     fun followsClub(settings: AppSettings, home: String, away: String): Boolean =
         !settings.footballFavouriteOnly || settings.favouriteClub.isBlank() ||

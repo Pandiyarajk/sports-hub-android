@@ -60,6 +60,9 @@ class LiveAlertService : Service() {
     private var indiaStarts: List<Long> = emptyList()
     private var indiaCheckedAt = 0L
 
+    /** Which of the targets are India matches, so the follow rule can be re-checked each turn. */
+    private var indiaIds: Set<String> = emptySet()
+
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -110,7 +113,7 @@ class LiveAlertService : Service() {
             // null: the poll failed, which says nothing about whether a match is live.
             val results = try {
                 buildList<Boolean?> {
-                    if (settings.cricketAlerts) add(pollCricket(settings, now, following))
+                    if (settings.anyCricket) add(pollCricket(settings, now, following))
                     if (settings.footballAlerts) add(pollFootball(settings, now, following))
                 }
             } catch (e: CancellationException) {
@@ -143,13 +146,21 @@ class LiveAlertService : Service() {
         finish(rescheduleOnly = true)
     }
 
-    /** True while an India match is live or about to start; null when nothing could be read. */
+    /**
+     * True while a followed cricket match (India's, or one belled on its screen) is live or about
+     * to start; null when nothing could be read. "india" names below cover both.
+     */
     private suspend fun pollCricket(settings: AppSettings, now: Long, following: MutableList<String>): Boolean? {
         var readSomething = false
         val fetch = appContainer.fetch
-        if (now - indiaCheckedAt > HEADER_EVERY_MILLIS || indiaTargets.isEmpty()) {
+        // A match just belled is not in the targets yet: read the header now, not in five minutes,
+        // but at most once a minute so a finished followed match cannot make it run every turn.
+        val newlyFollowed = settings.followedMatches.any { it !in indiaTargets } && now - indiaCheckedAt > 60_000
+        if (now - indiaCheckedAt > HEADER_EVERY_MILLIS || indiaTargets.isEmpty() || newlyFollowed) {
             safely {
-                val india = parseCricketHeader(fetch(get(CricketRepository.HEADER_URL))).filter { it.isIndia }
+                val all = parseCricketHeader(fetch(get(CricketRepository.HEADER_URL)))
+                indiaIds = all.filter { it.isIndia }.map { it.id }.toSet()
+                val india = all.filter { AlertScheduler.followsCricket(settings, it.id, it.isIndia) }
                 indiaTargets = india.filter { it.state != MatchState.RESULT }.associate { it.id to it.leagueId }
                 indiaStarts = india.filter { it.state == MatchState.UPCOMING }.mapNotNull { parseMillis(it.startIso) }
                 indiaCheckedAt = now
@@ -162,7 +173,8 @@ class LiveAlertService : Service() {
             safely {
                 val board = parseCricketLive(fetch(get(leagueBoardUrl(leagueId))))
                 readSomething = true
-                board.filter { it.matchId in indiaTargets && it.matchId !in settings.mutedMatches }.forEach { m ->
+                // Re-checked every turn, so unfollowing or turning India alerts off applies at once.
+                board.filter { it.matchId in indiaTargets && AlertScheduler.followsCricket(settings, it.matchId, it.matchId in indiaIds) }.forEach { m ->
                     AlertEngine.cricket(cricketSeen[m.matchId], m, settings.everyOver)
                         .map { a -> if (a.kind == AlertKind.WICKET) withDismissal(a, leagueId) else a }
                         .forEach { AlertNotifier.post(this, it) }
