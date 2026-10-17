@@ -65,6 +65,19 @@ class LiveParseTest {
     }
 
     @Test
+    fun `a reduced match shows its new over limit, as the feed writes it`() {
+        // Captured live Oct-17-2026: IND v WI cut to 9 overs a side by rain.
+        val b = parseCricketLive(fixture("cricket_league_reduced.json")).single().batting!!
+        assertEquals("IND 38/1 (2/9 ov)", b.display)
+        assertEquals(2, b.oversDone)
+    }
+
+    @Test
+    fun `without a feed score string the display falls back to the numbers`() {
+        assertEquals("IND 14/1 (1 ov)", Batting("IND", 1, 14, 1, 1, "1").display)
+    }
+
+    @Test
     fun `routine states are not interruptions`() {
         listOf("Live", "Result", "Scheduled", "", "  live ").forEach {
             assertEquals("", com.pandiyarajk.sportshub.data.cricket.interruption(it))
@@ -118,11 +131,60 @@ class CricketAlertTest {
     }
 
     @Test
-    fun `a wicket alerts even with every over off, and replaces that over's update`() {
+    fun `a wicket alerts even with every over off, and with it on the over update comes too`() {
         val alerts = AlertEngine.cricket(snap(40, 1, 5), snap(41, 2, 6), everyOver = false)
         assertEquals(listOf(AlertKind.WICKET), alerts.map { it.kind })
         assertTrue(alerts.single().title.startsWith("WICKET! IND 41/2"))
-        assertEquals(listOf(AlertKind.WICKET), AlertEngine.cricket(snap(40, 1, 5), snap(41, 2, 6), everyOver = true).map { it.kind })
+        // Wickets have their own notification now, so the over update no longer hides them.
+        assertEquals(listOf(AlertKind.WICKET, AlertKind.OVER), AlertEngine.cricket(snap(40, 1, 5), snap(41, 2, 6), everyOver = true).map { it.kind })
+    }
+
+    @Test
+    fun `the toss line is left out of overs and wickets once play has started`() {
+        // Live, Oct-17-2026: the over 1 alert read "West Indies won toss & fielded".
+        val toss = "West Indies won toss & fielded"
+        val alerts = AlertEngine.cricket(snap(13, 0, 0, summary = toss), snap(14, 1, 1, summary = toss), everyOver = true)
+        assertEquals(listOf(AlertKind.WICKET, AlertKind.OVER), alerts.map { it.kind })
+        assertTrue(alerts.none { "toss" in it.text })
+        // A chase line is real news and stays.
+        val chase = AlertEngine.cricket(snap(40, 1, 5, summary = "India need 30 runs"), snap(49, 1, 6, summary = "India need 21 runs"), everyOver = true)
+        assertTrue(chase.single().text.endsWith("India need 21 runs"))
+        // At the start, the toss is the news.
+        assertTrue(AlertEngine.cricket(null, snap(0, 0, 0, summary = toss), everyOver = true).single().text.contains("toss"))
+        // Picked up mid-innings (live: 70/3 after 4.5 overs), it is not.
+        val midInnings = AlertEngine.cricket(null, snap(70, 3, 4, summary = toss), everyOver = true).single()
+        assertFalse(midInnings.text.contains("toss"))
+    }
+
+    @Test
+    fun `a wicket in the same poll as play restarting after rain is not lost`() {
+        // The live case, Oct-17-2026: rain delay over and a wicket down by the next poll.
+        val delayed = snap(4, 0, 0).copy(interruption = "Match delayed by rain")
+        val alerts = AlertEngine.cricket(delayed, snap(9, 1, 0), everyOver = true)
+        assertEquals(listOf(AlertKind.INTERRUPTION, AlertKind.WICKET), alerts.map { it.kind })
+    }
+
+    @Test
+    fun `wickets already down when an innings is first seen are alerted`() {
+        val noBattingYet = snap(0, 0, 0).copy(batting = null)
+        val alerts = AlertEngine.cricket(noBattingYet, snap(9, 1, 0), everyOver = true)
+        assertEquals(listOf(AlertKind.INNINGS, AlertKind.WICKET), alerts.map { it.kind })
+        assertTrue(alerts[1].title.startsWith("WICKET! IND 9/1"))
+    }
+
+    @Test
+    fun `runs in the over are exact when its start is known, else the run rate`() {
+        fun bat(runs: Int, overs: String) =
+            Batting("IND", 1, runs, 1, overs.substringBefore('.').toInt(), overs)
+        // Live, Oct-17-2026: 13/1 after 0.5, 14/1 after 1. The first over started at 0: 14 runs,
+        // not the "1 run" the old difference-since-last-poll reported.
+        assertEquals("14 runs in the over", AlertEngine.overLine(bat(13, "0.5"), bat(14, "1")))
+        // The previous poll landed exactly on the boundary: exact.
+        assertEquals("9 runs in the over", AlertEngine.overLine(bat(40, "5"), bat(49, "6")))
+        // Previous poll mid-over: unknown start, so the rate (49 off 36 balls).
+        assertEquals("RR 8.16", AlertEngine.overLine(bat(45, "5.3"), bat(49, "6")))
+        // Already into the next over: also the rate.
+        assertTrue(AlertEngine.overLine(bat(40, "5"), bat(52, "6.2")).startsWith("RR "))
     }
 
     @Test
@@ -154,8 +216,10 @@ class CricketAlertTest {
         assertEquals("No ball bowled yet", stop.text)
         assertTrue(AlertEngine.cricket(delayed, delayed, everyOver = true).isEmpty())
 
-        val resumed = AlertEngine.cricket(delayed, snap(0, 0, 0), everyOver = true).single()
-        assertEquals("IND v WI: play under way", resumed.title)
+        val resumed = AlertEngine.cricket(delayed, snap(0, 0, 0), everyOver = true)
+        assertEquals("IND v WI: play under way", resumed.first().title)
+        // The first batting snapshot arrives with the restart, so the innings line comes too.
+        assertEquals(listOf(AlertKind.INTERRUPTION, AlertKind.INNINGS), resumed.map { it.kind })
     }
 
     @Test

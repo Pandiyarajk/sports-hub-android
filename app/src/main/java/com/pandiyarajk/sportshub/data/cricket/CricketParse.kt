@@ -74,13 +74,143 @@ fun parseCricketHeader(body: String): List<CricketMatch> {
  * `matchcards` for some matches and leaves it empty for others, live ones included, while the
  * same figures sit per player under `rosters`; the rosters are the fallback.
  */
-fun parseScorecard(body: String): Scorecard {
+fun parseScorecard(body: String, known: Map<String, String> = emptyMap()): Scorecard {
     val root = Http.json.parseToJsonElement(body)
     val fromCards = parseMatchcards(root)
-    val innings = if (fromCards.isNotEmpty()) fromCards else parseRosterInnings(root)
+    val dismissals = known + runCatching { wicketBalls(root).associate { it.batter to it.how } }.getOrDefault(emptyMap())
+    val innings = (if (fromCards.isNotEmpty()) fromCards else parseRosterInnings(root)).map { inn ->
+        inn.copy(batting = inn.batting.map { r -> r.copy(dismissal = fullDismissal(r.name, r.dismissal, dismissals)) })
+    }
     // The live panel is extra: a failure to read it must never cost the scorecard.
     val live = runCatching { parseLivePanel(root)?.let { reconcile(it, innings) } }.getOrNull()
-    return Scorecard(innings, live)
+    // Out, but only the code is known: the repository looks these up in the play-by-play.
+    val unresolved = innings.flatMap { it.batting }
+        .filter { r -> !r.dismissal.equals("not out", ignoreCase = true) && r.dismissal.isNotBlank() && r.name !in dismissals }
+        .map { it.name }.toSet()
+    return Scorecard(innings, live, dismissals, unresolved)
+}
+
+/** One wicket from the ball-by-ball: who, how ("c Joseph b Paul") and the full line. */
+data class WicketBall(
+    val batter: String,
+    val how: String,
+    val line: String,
+    val sequence: Long,
+    /** The bowler's full name from the ball, "Keemo Paul"; the dismissal text has only "Paul". */
+    val bowler: String = "",
+    val runs: String = "",
+    val balls: String = "",
+) {
+    /** "Abhishek Sharma 6 (4) caught by Joseph, bowled by Keemo Paul", for the wicket alert. */
+    val alertText: String
+        get() {
+            val score = if (runs.isNotBlank()) " $runs" + (if (balls.isNotBlank()) " ($balls)" else "") else ""
+            return "$batter$score ${describeDismissal(how, bowler)}".trim()
+        }
+}
+
+/**
+ * Cricket notation in words, for an alert read at a glance:
+ * "c Joseph b Paul" is caught by Joseph, bowled by Paul; "c †Hope b Holder" is caught by the
+ * keeper; "c & b Paul" is caught and bowled; "st †Hope b Chase" is stumped; "run out (Joseph/Hope)"
+ * names both fielders; lbw, bowled and hit wicket name the bowler. The bowler's full name is used
+ * when known. Anything else is returned as given.
+ */
+fun describeDismissal(how: String, bowlerFull: String = ""): String {
+    val h = how.trim()
+    fun bowler(short: String) = bowlerFull.ifBlank { short.trim() }
+    fun fielder(name: String) = name.trim().removePrefix("†").trim()
+    fun keeper(name: String) = if (name.trim().startsWith("†")) " (keeper)" else ""
+
+    Regex("""^c\s*(?:&|and)\s*b\s+(.+)$""", RegexOption.IGNORE_CASE).find(h)?.let {
+        return "caught and bowled by ${bowler(it.groupValues[1])}"
+    }
+    Regex("""^c\s+(.+?)\s+b\s+(.+)$""").find(h)?.let {
+        val f = it.groupValues[1]
+        return "caught by ${fielder(f)}${keeper(f)}, bowled by ${bowler(it.groupValues[2])}"
+    }
+    Regex("""^st\s+(.+?)\s+b\s+(.+)$""").find(h)?.let {
+        return "stumped by ${fielder(it.groupValues[1])}, bowled by ${bowler(it.groupValues[2])}"
+    }
+    Regex("""^run out\s*\((.+)\)$""", RegexOption.IGNORE_CASE).find(h)?.let {
+        return "run out by " + it.groupValues[1].split("/").map(::fielder).filter { n -> n.isNotBlank() }.joinToString(" and ")
+    }
+    if (h.equals("run out", ignoreCase = true)) return "run out"
+    Regex("""^lbw\s+b\s+(.+)$""", RegexOption.IGNORE_CASE).find(h)?.let { return "lbw, bowled by ${bowler(it.groupValues[1])}" }
+    Regex("""^hit wicket\s+b\s+(.+)$""", RegexOption.IGNORE_CASE).find(h)?.let { return "hit wicket, bowled by ${bowler(it.groupValues[1])}" }
+    Regex("""^b\s+(.+)$""").find(h)?.let { return "bowled by ${bowler(it.groupValues[1])}" }
+    return h
+}
+
+/**
+ * Wicket balls from header.competitions[0].commentaries, oldest first. The roster stats only
+ * carry a code ("c"); the commentary says who caught it and who bowled it:
+ * "Abhishek Sharma c Joseph b Paul 6 (4b 0x4 1x6) SR: 150". The commentary holds only the
+ * last few overs, so callers keep what they have seen.
+ */
+fun wicketBalls(root: JsonElement): List<WicketBall> =
+    wicketBallsIn(
+        (root.at("header").at("competitions").list().firstOrNull().at("commentaries")
+            as? kotlinx.serialization.json.JsonObject)?.values.orEmpty(),
+    )
+
+/**
+ * One page of the play-by-play (25 balls, oldest first): its wickets and how many pages there
+ * are. The summary's commentary keeps only the last few overs; this reaches the earlier ones,
+ * so a wicket from the first over still reads "c Joseph b Paul" an hour later.
+ */
+fun parsePlayByPlayPage(body: String): Pair<List<WicketBall>, Int> {
+    val c = Http.json.parseToJsonElement(body).at("commentary")
+    return wicketBallsIn(c.at("items").list()) to c.at("pageCount").int()
+}
+
+private fun wicketBallsIn(balls: Collection<JsonElement>): List<WicketBall> {
+    return balls.mapNotNull { b ->
+        val d = b.at("dismissal")
+        if (d.at("dismissal").text() != "true") return@mapNotNull null
+        val text = d.at("text").text().ifBlank { return@mapNotNull null }
+        val athlete = d.at("batsman").at("athlete")
+        val name = athlete.at("displayName").text().ifBlank { athlete.at("name").text() }
+        // "Abhishek Sharma c Joseph b Paul 6 (4b 0x4 1x6) SR: 150". The name at the front is not
+        // always the display name (seen live: "SV Samson b Springer" for Sanju Samson), so the how
+        // is found by where the dismissal starts, not by stripping the name.
+        val figures = Regex("""^(.*?)\s+(\d+)\s+\((\d+)b""").find(text)
+        val head = figures?.groupValues?.get(1) ?: text.substringBefore(" SR:")
+        val start = DISMISSAL_START.find(head)?.range?.first
+        val how = if (start != null) head.substring(start) else head.removePrefix(name).trim()
+        WicketBall(
+            batter = name.ifBlank { text.substringBefore(" $how") },
+            how = how.trim(),
+            line = text.substringBefore(" SR:").trim(),
+            sequence = b.at("sequence").text().toLongOrNull() ?: 0L,
+            bowler = b.at("bowler").at("athlete").at("displayName").text(),
+            runs = figures?.groupValues?.get(2).orEmpty(),
+            balls = figures?.groupValues?.get(3).orEmpty(),
+        )
+    }.sortedBy { it.sequence }
+}
+
+fun wicketBalls(body: String): List<WicketBall> = wicketBalls(Http.json.parseToJsonElement(body))
+
+/**
+ * Where a dismissal begins inside "SV Samson b Springer": a lowercase keyword after a space.
+ * Case matters, so an initial in a name ("C Green c Smith b Starc") is not taken for "c".
+ */
+private val DISMISSAL_START = Regex(
+    """(?<=\s)(c\s|st\s|run out|lbw\s|b\s|hit wicket|retired|obstructing|handled|timed out|absent)""",
+)
+
+/** The roster's dismissal codes in words, for wickets that fell before the commentary window. */
+private val DISMISSAL_CODES = mapOf(
+    "c" to "caught", "b" to "bowled", "lbw" to "lbw", "st" to "stumped", "ro" to "run out",
+    "run out" to "run out", "hw" to "hit wicket", "ct" to "caught",
+)
+
+/** The full "c Joseph b Paul" when known; else the code in words; else as given. */
+internal fun fullDismissal(name: String, given: String, known: Map<String, String>): String {
+    if (given.equals("not out", ignoreCase = true)) return given
+    known[name]?.let { return it }
+    return DISMISSAL_CODES[given.trim().lowercase()] ?: given
 }
 
 /**

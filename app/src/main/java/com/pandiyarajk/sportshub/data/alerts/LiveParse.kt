@@ -32,11 +32,11 @@ fun parseCricketLive(body: String): List<CricketLive> =
         // innings no line may be current; then the latest batting line by period stands.
         val lines = comp.at("competitors").list().flatMap { c ->
             val team = c.at("team").at("abbreviation").text()
-            c.at("linescores").list().filter { it.at("isBatting").text() == "true" }.map { team to it }
+            c.at("linescores").list().filter { it.at("isBatting").text() == "true" }.map { Triple(team, it, c) }
         }
-        val pick = lines.firstOrNull { (_, l) -> l.at("isCurrent").int() == 1 }
-            ?: lines.maxByOrNull { (_, l) -> l.at("period").int() }
-        val batting = pick?.let { (team, l) ->
+        val pick = lines.firstOrNull { (_, l, _) -> l.at("isCurrent").int() == 1 }
+            ?: lines.maxByOrNull { (_, l, _) -> l.at("period").int() }
+        val batting = pick?.let { (team, l, c) ->
             val oversText = l.at("overs").text()
             Batting(
                 team = team,
@@ -45,6 +45,8 @@ fun parseCricketLive(body: String): List<CricketLive> =
                 wickets = l.at("wickets").int(),
                 oversDone = oversText.substringBefore('.').toIntOrNull() ?: 0,
                 oversText = oversText.removeSuffix(".0"),
+                // The current innings' own string first; the side's string covers older feeds.
+                scoreText = l.at("score").text().ifBlank { c.at("score").text() },
             )
         }
         val stop = interruption(status.at("type").at("description").text())

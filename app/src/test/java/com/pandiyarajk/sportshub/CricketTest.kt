@@ -204,6 +204,87 @@ class ScorecardParseTest {
     }
 
     @Test
+    fun `a catch names the fielder and the bowler, not just c`() {
+        // Captured live Oct-17-2026: the roster said only "c" for Abhishek Sharma.
+        val wicket = com.pandiyarajk.sportshub.data.cricket.wicketBalls(fixture("cricket_summary_wicket.json")).single()
+        assertEquals("Abhishek Sharma", wicket.batter)
+        assertEquals("c Joseph b Paul", wicket.how)
+        assertEquals("Abhishek Sharma c Joseph b Paul 6 (4b 0x4 1x6)", wicket.line)
+
+        val row = parseScorecard(fixture("cricket_summary_wicket.json")).innings.single()
+            .batting.first { it.name == "Abhishek Sharma" }
+        assertEquals("c Joseph b Paul", row.dismissal)
+    }
+
+    @Test
+    fun `a dismissal seen once is kept after it leaves the commentary window`() {
+        // Same match later: the commentary no longer has the wicket ball.
+        val body = fixture("cricket_summary_wicket.json").replace("\"dismissal\": true", "\"dismissal\": false")
+        val card = parseScorecard(body, known = mapOf("Abhishek Sharma" to "c Joseph b Paul"))
+        assertEquals("c Joseph b Paul", card.innings.single().batting.first { it.name == "Abhishek Sharma" }.dismissal)
+        // And with nothing remembered, the code in words rather than a bare letter.
+        val cold = parseScorecard(body)
+        assertEquals("caught", cold.innings.single().batting.first { it.name == "Abhishek Sharma" }.dismissal)
+    }
+
+    @Test
+    fun `the wicket alert names batter, catcher and bowler in words`() {
+        // Live, Oct-17-2026: Abhishek Sharma c Joseph b Paul 6 (4b), bowled by Keemo Paul.
+        val w = com.pandiyarajk.sportshub.data.cricket.wicketBalls(fixture("cricket_summary_wicket.json")).single()
+        assertEquals("Keemo Paul", w.bowler)
+        assertEquals("Abhishek Sharma 6 (4) caught by Joseph, bowled by Keemo Paul", w.alertText)
+    }
+
+    @Test
+    fun `the dismissal is found even when the line uses a different name for the batter`() {
+        // Live, Oct-17-2026: "SV Samson b Springer 16 (7b 2x4 1x6) SR: 228.57" for Sanju Samson.
+        fun ball(batter: String, text: String) = """{"commentary":{"pageCount":1,"items":[{"sequence":1,
+            "dismissal":{"dismissal":true,"text":"$text","batsman":{"athlete":{"displayName":"$batter"}}},
+            "bowler":{"athlete":{"displayName":"Shamar Springer"}}}]}}"""
+        val samson = com.pandiyarajk.sportshub.data.cricket.parsePlayByPlayPage(
+            ball("Sanju Samson", "SV Samson b Springer 16 (7b 2x4 1x6) SR: 228.57"),
+        ).first.single()
+        assertEquals("Sanju Samson", samson.batter)
+        assertEquals("b Springer", samson.how)
+        assertEquals("Sanju Samson 16 (7) bowled by Shamar Springer", samson.alertText)
+
+        val green = com.pandiyarajk.sportshub.data.cricket.parsePlayByPlayPage(
+            ball("Cameron Green", "C Green c Smith b Starc 4 (6b 1x4 0x6) SR: 66.66"),
+        ).first.single()
+        assertEquals("c Smith b Starc", green.how)
+
+        val runOut = com.pandiyarajk.sportshub.data.cricket.parsePlayByPlayPage(
+            ball("Tilak Varma", "NT Tilak Varma run out (Joseph/†Hope) 2 (3b 0x4 0x6) SR: 66.66"),
+        ).first.single()
+        assertEquals("run out (Joseph/†Hope)", runOut.how)
+        assertEquals("Tilak Varma 2 (3) run out by Joseph and Hope", runOut.alertText)
+    }
+
+    @Test
+    fun `every kind of dismissal reads in words`() {
+        fun d(how: String, bowler: String = "") = com.pandiyarajk.sportshub.data.cricket.describeDismissal(how, bowler)
+        assertEquals("caught by Joseph, bowled by Keemo Paul", d("c Joseph b Paul", "Keemo Paul"))
+        assertEquals("caught by Hope (keeper), bowled by Holder", d("c †Hope b Holder"))
+        assertEquals("caught and bowled by Roston Chase", d("c & b Chase", "Roston Chase"))
+        assertEquals("caught and bowled by Chase", d("c and b Chase"))
+        assertEquals("stumped by Hope, bowled by Akeal Hosein", d("st †Hope b Hosein", "Akeal Hosein"))
+        assertEquals("run out by Joseph", d("run out (Joseph)"))
+        assertEquals("run out by Joseph and Hope", d("run out (Joseph/†Hope)"))
+        assertEquals("run out", d("run out"))
+        assertEquals("lbw, bowled by Holder", d("lbw b Holder"))
+        assertEquals("bowled by Jason Holder", d("b Holder", "Jason Holder"))
+        assertEquals("hit wicket, bowled by Holder", d("hit wicket b Holder"))
+        assertEquals("retired hurt", d("retired hurt"))
+    }
+
+    @Test
+    fun `not out stays not out and unknown codes stay as given`() {
+        assertEquals("not out", com.pandiyarajk.sportshub.data.cricket.fullDismissal("A", "not out", mapOf("A" to "c X b Y")))
+        assertEquals("obstructing the field", com.pandiyarajk.sportshub.data.cricket.fullDismissal("A", "obstructing the field", emptyMap()))
+        assertEquals("stumped", com.pandiyarajk.sportshub.data.cricket.fullDismissal("A", "st", emptyMap()))
+    }
+
+    @Test
     fun `overs convert to balls`() {
         assertEquals(34, com.pandiyarajk.sportshub.data.cricket.oversToBalls("5.4"))
         assertEquals(30, com.pandiyarajk.sportshub.data.cricket.oversToBalls("5"))
@@ -248,8 +329,9 @@ class CricketRepositoryTest {
     @Test
     fun `a finished scorecard is fetched once, a live one every time`() = runBlocking {
         var calls = 0
-        val repo = CricketRepository {
-            calls++
+        val repo = CricketRepository { req ->
+            // Summary fetches only: a play-by-play lookup for unresolved dismissals is separate.
+            if ("summary" in req.url.toString()) calls++
             fixture("cricket_summary.json")
         }
         val done = match("done", "L", MatchState.RESULT, listOf(team("A", "A")))
@@ -260,6 +342,35 @@ class CricketRepositoryTest {
         repo.scorecard(live)
         repo.scorecard(live)
         assertEquals(3, calls)
+    }
+
+    @Test
+    fun `a wicket gone from the commentary window is filled from the play-by-play, once`() = runBlocking {
+        // Live, Oct-17-2026: after a restart, Abhishek Sharma read only "caught".
+        val summaryWithoutWicketBall = fixture("cricket_summary_wicket.json").replace("\"dismissal\": true", "\"dismissal\": false")
+        var pages = 0
+        val repo = CricketRepository { req ->
+            val url = req.url.toString()
+            when {
+                "playbyplay" in url -> { pages++; fixture("cricket_playbyplay_page1.json") }
+                else -> summaryWithoutWicketBall
+            }
+        }
+        val live = match("1529234", "West Indies tour of India", MatchState.LIVE, listOf(team("India", "IND")))
+        val card = (repo.scorecard(live) as Load.Ok).value
+        assertEquals("c Joseph b Paul", card.innings.single().batting.first { it.name == "Abhishek Sharma" }.dismissal)
+        assertTrue(pages >= 1)
+        val after = pages
+        repo.scorecard(live)
+        assertEquals("the gap is filled, so no more pages", after, pages)
+    }
+
+    @Test
+    fun `the play-by-play page gives every wicket on it with the full text`() {
+        val (wickets, pageCount) = com.pandiyarajk.sportshub.data.cricket.parsePlayByPlayPage(fixture("cricket_playbyplay_page1.json"))
+        assertEquals(2, pageCount)
+        assertEquals(listOf("Abhishek Sharma" to "c Joseph b Paul", "Ishan Kishan" to "c Powell b Joseph"), wickets.map { it.batter to it.how })
+        assertEquals("Ishan Kishan 30 (10) caught by Powell, bowled by Shamar Joseph", wickets[1].alertText)
     }
 
     @Test

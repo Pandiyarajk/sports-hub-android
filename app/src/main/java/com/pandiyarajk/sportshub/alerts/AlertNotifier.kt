@@ -1,5 +1,6 @@
 // Author: Pandiyaraj Karuppasamy
 // Date: Oct-17-2026
+// Modified: Oct-17-2026 (wickets, goals and results get a notification each)
 
 package com.pandiyarajk.sportshub.alerts
 
@@ -79,11 +80,20 @@ object AlertNotifier {
             .build()
     }
 
-    /** One notification per match, replaced by each later alert for it. */
+    /**
+     * Routine updates (each over, kick-off, half-time) share one notification per match and
+     * replace each other. Big moments (wickets, goals, results, full-time) each get their own:
+     * measured on the phone, a wicket and a goal were overwritten by the next over update and by
+     * full-time, so the user never saw them.
+     */
     fun post(context: Context, alert: Alert) {
         if (!canPost(context)) return
         ensureChannels(context)
-        val id = notificationId(alert.sport, alert.matchId)
+        val id = if (alert.kind.important) {
+            eventId(alert.sport, alert.matchId, alert.title)
+        } else {
+            notificationId(alert.sport, alert.matchId)
+        }
         val n = NotificationCompat.Builder(context, if (alert.kind.important) CHANNEL_BIG else CHANNEL_UPDATES)
             .setSmallIcon(R.drawable.ic_stat_live)
             .setContentTitle(alert.title)
@@ -129,4 +139,8 @@ object AlertNotifier {
     fun notificationId(sport: AlertSport, matchId: String): Int =
         // Kept clear of the two fixed ids above.
         ("${sport.name}:$matchId".hashCode() and 0x3FFFFFFF) + 16
+
+    /** One id per event: the title carries the score, so each wicket or goal is distinct. */
+    fun eventId(sport: AlertSport, matchId: String, title: String): Int =
+        ("${sport.name}:$matchId:$title".hashCode() and 0x3FFFFFFF) + 16
 }
