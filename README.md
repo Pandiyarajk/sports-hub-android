@@ -105,8 +105,10 @@ fresh. Not affiliated with or endorsed by ESPN, ESPNcricinfo or the Premier Leag
 
 ## Install
 
-Build it (below) and install the APK with `adb install -r`, or copy it to the phone and open it.
-Android 8.0 (API 26) or later. The release APK is named after the app id, `com.pandiyarajk.sportshub.apk`.
+Download `com.pandiyarajk.sportshub.apk` from the [latest release](https://github.com/Pandiyarajk/sports-hub-android/releases/latest)
+and open it on the phone, or install it with `adb install -r`. Android 8.0 (API 26) or later. The release
+notes give the APK's SHA-256 and the signing certificate's, to check the download. Or build it yourself
+(below).
 
 ## Building
 
