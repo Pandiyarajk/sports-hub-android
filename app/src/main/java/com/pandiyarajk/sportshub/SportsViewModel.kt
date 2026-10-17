@@ -234,6 +234,17 @@ class SportsViewModel(app: Application) : AndroidViewModel(app) {
         syncAlertsNow()
     }
 
+    /**
+     * The bell on a cricket match screen. On: alerts for this one match, whatever the India
+     * setting. Off: stop following it; an India match that India alerts would still cover is
+     * muted instead, as "Stop until next match" does.
+     */
+    fun followMatch(matchId: String, on: Boolean, coveredByIndiaAlerts: Boolean) = viewModelScope.launch {
+        container.settings.follow(matchId, on)
+        if (!on && coveredByIndiaAlerts) container.settings.mute(listOf(matchId))
+        syncAlertsNow()
+    }
+
     /** Also called when notification permission arrives, since a sync without it cancels everything. */
     fun syncAlerts() = viewModelScope.launch { syncAlertsNow() }
 

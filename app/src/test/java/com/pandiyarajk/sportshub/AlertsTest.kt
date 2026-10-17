@@ -29,7 +29,8 @@ class LiveParseTest {
         assertEquals("1554419", m.matchId)
         assertEquals("CAN v NEP", m.title)
         assertEquals(MatchState.LIVE, m.state)
-        assertEquals("Nepal require 90 runs", m.summary)
+        // The feed says "Nepal require 90 runs"; 35.5 of 50 overs bowled leaves 85 balls.
+        assertEquals("Nepal require 90 runs from 85 balls", m.summary)
         val b = m.batting!!
         assertEquals("NEP", b.team)
         assertEquals(2, b.innings)
@@ -284,6 +285,24 @@ class FootballAlertTest {
         val goal = AlertEngine.football(snap(0, 0), snap(1, 0)).single()
         assertEquals(AlertKind.GOAL, goal.kind)
         assertEquals("30'", goal.text)
+    }
+}
+
+class FollowMatchTest {
+    @Test
+    fun `India alerts cover India matches, the bell covers any one match, a mute beats both`() {
+        val indiaOn = AppSettings(cricketAlerts = true)
+        assertTrue(AlertScheduler.followsCricket(indiaOn, "ind", isIndia = true))
+        assertFalse(AlertScheduler.followsCricket(indiaOn, "banzim", isIndia = false))
+
+        val belled = AppSettings(followedMatches = setOf("banzim"))
+        assertTrue(AlertScheduler.followsCricket(belled, "banzim", isIndia = false))
+        assertFalse(AlertScheduler.followsCricket(belled, "ind", isIndia = true))
+        assertTrue(belled.anyAlerts)
+        assertTrue(belled.anyCricket)
+
+        val muted = AppSettings(cricketAlerts = true, followedMatches = setOf("ind"), mutedMatches = setOf("ind"))
+        assertFalse(AlertScheduler.followsCricket(muted, "ind", isIndia = true))
     }
 }
 

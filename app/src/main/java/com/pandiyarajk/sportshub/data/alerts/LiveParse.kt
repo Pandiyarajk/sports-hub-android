@@ -6,6 +6,7 @@ package com.pandiyarajk.sportshub.data.alerts
 import com.pandiyarajk.sportshub.data.Http
 import com.pandiyarajk.sportshub.data.at
 import com.pandiyarajk.sportshub.data.cricket.MatchState
+import com.pandiyarajk.sportshub.data.cricket.chaseLine
 import com.pandiyarajk.sportshub.data.cricket.interruption
 import com.pandiyarajk.sportshub.data.int
 import com.pandiyarajk.sportshub.data.list
@@ -54,7 +55,11 @@ fun parseCricketLive(body: String): List<CricketLive> =
             matchId = id,
             title = e.at("shortName").text(),
             state = state,
-            summary = stop.ifBlank { status.at("summary").text() }.ifBlank { status.at("type").at("detail").text() },
+            // In a chase: "India require 40 runs from 21 balls".
+            summary = chaseLine(
+                stop.ifBlank { status.at("summary").text() }.ifBlank { status.at("type").at("detail").text() },
+                batting?.scoreText.orEmpty(),
+            ),
             interruption = stop,
             batting = batting,
             startMillis = parseMillis(e.at("date").text()),

@@ -24,6 +24,21 @@ private val ROUTINE_STATUS = setOf("live", "result", "scheduled", "")
 fun interruption(description: String): String =
     description.trim().takeUnless { it.lowercase() in ROUTINE_STATUS }.orEmpty()
 
+/**
+ * "Bangladesh require 235 runs from 268 balls". The feed says only the runs; the balls left come
+ * from its own score string, "37/0 (5.2/50 ov, target 272)", so a rain-reduced limit (9 overs) is
+ * right too. Anything that is not a chase, or already names the balls, is returned as given.
+ */
+fun chaseLine(summary: String, scoreText: String): String {
+    if (summary.isBlank() || summary.contains("ball", ignoreCase = true)) return summary
+    if (!Regex("""\b(require|requires|need|needs)\b""", RegexOption.IGNORE_CASE).containsMatchIn(summary)) return summary
+    val m = Regex("""\((\d+)(?:\.(\d))?/(\d+) ov, target \d+\)""").find(scoreText) ?: return summary
+    val bowled = m.groupValues[1].toInt() * 6 + (m.groupValues[2].toIntOrNull() ?: 0)
+    val left = m.groupValues[3].toInt() * 6 - bowled
+    if (left <= 0) return summary
+    return "$summary from $left ball${if (left == 1) "" else "s"}"
+}
+
 /** Parses the single scoreboard header call: every league and match in one payload. */
 fun parseCricketHeader(body: String): List<CricketMatch> {
     val root = Http.json.parseToJsonElement(body)
@@ -56,9 +71,12 @@ fun parseCricketHeader(body: String): List<CricketMatch> {
                 venue = location,
                 startIso = e.at("date").text(),
                 state = state,
-                status = interruption(full.at("type").at("description").text())
-                    .ifBlank { full.at("longSummary").text() }
-                    .ifBlank { full.at("summary").text() },
+                status = chaseLine(
+                    interruption(full.at("type").at("description").text())
+                        .ifBlank { full.at("longSummary").text() }
+                        .ifBlank { full.at("summary").text() },
+                    teams.firstOrNull { "target" in it.score }?.score.orEmpty(),
+                ),
                 teams = teams,
                 isIndia = IndiaFilter.isIndia(leagueName, teams),
                 label = e.at("title").text().removeSuffix(" (D/N)").trim(),
@@ -77,8 +95,13 @@ fun parseCricketHeader(body: String): List<CricketMatch> {
 fun parseScorecard(body: String, known: Map<String, String> = emptyMap()): Scorecard {
     val root = Http.json.parseToJsonElement(body)
     val fromCards = parseMatchcards(root)
+    val fromRosters = parseRosterInnings(root)
     val dismissals = known + runCatching { wicketBalls(root).associate { it.batter to it.how } }.getOrDefault(emptyMap())
-    val innings = (if (fromCards.isNotEmpty()) fromCards else parseRosterInnings(root)).map { inn ->
+    // Per-player stats first, matchcards only for an innings the stats lack. Measured live on
+    // BAN v ZIM: matchcards held only Zimbabwe's innings, frozen at 236/8 after 46.3 overs while
+    // the real total was 271/8 off 50, and nothing of the chase. The stats had both, current.
+    val byNumber = fromCards.associateBy { it.number } + fromRosters.associateBy { it.number }
+    val innings = byNumber.toSortedMap().values.map { inn ->
         inn.copy(batting = inn.batting.map { r -> r.copy(dismissal = fullDismissal(r.name, r.dismissal, dismissals)) })
     }
     // The live panel is extra: a failure to read it must never cost the scorecard.
@@ -370,6 +393,20 @@ private fun parseMatchcards(root: JsonElement): List<Innings> {
  * is a batting row for his own team's innings; a player with balls bowled is a bowling row.
  * The innings total comes from the header line score of the side batting in that period.
  */
+/**
+ * "8 (b 2, w 5, nb 1)" from an innings' header line statistics, as a scorecard writes extras,
+ * leaving out the kinds that are zero. Blank when the line has no statistics yet.
+ */
+internal fun extrasFrom(line: JsonElement?): String {
+    val st = line.at("statistics").at("categories").list()
+        .flatMap { it.at("stats").list() }
+        .associate { it.at("name").text() to it.at("displayValue").text() }
+    val total = st["extras"]?.takeIf { it.isNotBlank() } ?: return ""
+    val parts = listOf("byes" to "b", "legbyes" to "lb", "wides" to "w", "noballs" to "nb", "penalties" to "pen")
+        .mapNotNull { (key, short) -> st[key]?.toIntOrNull()?.takeIf { it > 0 }?.let { "$short $it" } }
+    return if (parts.isEmpty()) total else "$total (${parts.joinToString(", ")})"
+}
+
 private fun parseRosterInnings(root: JsonElement): List<Innings> {
     class Bat(val innings: Int, val team: String, val position: Int, val row: BattingRow)
     class Bowl(val innings: Int, val position: Int, val row: BowlingRow)
@@ -429,7 +466,7 @@ private fun parseRosterInnings(root: JsonElement): List<Innings> {
                 ?: headerLine?.first.at("team").at("displayName").text(),
             runs = runs,
             total = if (overs.isNotBlank()) "($overs ov)" else "",
-            extras = "",
+            extras = extrasFrom(headerLine?.second),
             batting = batting.map { it.row },
             bowling = bowls.filter { it.innings == n }.sortedBy { it.position }.map { it.row },
         )

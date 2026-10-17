@@ -1,6 +1,6 @@
 // Author: Pandiyaraj Karuppasamy
 // Date: Oct-17-2026
-// Modified: Oct-17-2026 (corrupt settings fall back to defaults; live alert settings)
+// Modified: Oct-17-2026 (corrupt settings fall back to defaults; live alert settings; follow one match)
 
 package com.pandiyarajk.sportshub.data
 
@@ -38,8 +38,13 @@ data class AppSettings(
     val footballFavouriteOnly: Boolean = false,
     /** Matches the user stopped following from the notification; the next match alerts again. */
     val mutedMatches: Set<String> = emptySet(),
+    /** Cricket matches followed one by one (the bell on a match screen), India or not. */
+    val followedMatches: Set<String> = emptySet(),
 ) {
-    val anyAlerts: Boolean get() = cricketAlerts || footballAlerts
+    val anyAlerts: Boolean get() = cricketAlerts || footballAlerts || followedMatches.isNotEmpty()
+
+    /** Whether cricket needs polling at all: India alerts on, or any match followed. */
+    val anyCricket: Boolean get() = cricketAlerts || followedMatches.isNotEmpty()
 }
 
 class SettingsRepository(private val store: DataStore<Preferences>, scope: CoroutineScope) {
@@ -58,6 +63,7 @@ class SettingsRepository(private val store: DataStore<Preferences>, scope: Corou
             footballAlerts = p[FOOTBALL_ALERTS] ?: false,
             footballFavouriteOnly = p[FOOTBALL_FAVOURITE_ONLY] ?: false,
             mutedMatches = p[MUTED].orEmpty(),
+            followedMatches = p[FOLLOWED].orEmpty(),
         )
     }.stateIn(scope, SharingStarted.Eagerly, null)
 
@@ -77,12 +83,20 @@ class SettingsRepository(private val store: DataStore<Preferences>, scope: Corou
         p[MUTED] = (p[MUTED].orEmpty() + matchIds).toList().takeLast(MAX_MUTED).toSet()
     }
 
+    /** Follow or stop following one match; following also lifts a mute on it. Kept short like mutes. */
+    suspend fun follow(matchId: String, on: Boolean) = store.edit { p ->
+        val now = p[FOLLOWED].orEmpty()
+        p[FOLLOWED] = if (on) (now + matchId).toList().takeLast(MAX_MUTED).toSet() else now - matchId
+        if (on) p[MUTED] = p[MUTED].orEmpty() - matchId
+    }
+
     /** The current settings for code outside the UI (the alert service), waiting for the first read. */
     suspend fun read(): AppSettings = settings.first { it != null } ?: AppSettings()
 
     private companion object {
         const val MAX_MUTED = 40
         val MUTED = stringSetPreferencesKey("alerts.muted")
+        val FOLLOWED = stringSetPreferencesKey("alerts.followed")
         val CRICKET_ALERTS = booleanPreferencesKey("alerts.cricket")
         val EVERY_OVER = booleanPreferencesKey("alerts.cricket.every_over")
         val FOOTBALL_ALERTS = booleanPreferencesKey("alerts.football")

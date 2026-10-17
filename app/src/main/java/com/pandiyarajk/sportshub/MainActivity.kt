@@ -1,7 +1,7 @@
 // Author: Pandiyaraj Karuppasamy
 // Date: Oct-17-2026
 // Modified: Oct-17-2026 (detail screens survive process death until their data loads; a tapped
-//   alert opens its match; football match screen)
+//   alert opens its match; football match screen; follow bell on a cricket match)
 
 @file:OptIn(ExperimentalMaterial3Api::class)
 
@@ -40,6 +40,10 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.pandiyarajk.sportshub.alerts.AlertNotifier
+import com.pandiyarajk.sportshub.alerts.AlertScheduler
+import com.pandiyarajk.sportshub.data.cricket.MatchState
+import com.pandiyarajk.sportshub.ui.AlertBell
+import com.pandiyarajk.sportshub.ui.rememberNotificationGate
 import com.pandiyarajk.sportshub.data.AppSettings
 import com.pandiyarajk.sportshub.data.alerts.AlertSport
 import com.pandiyarajk.sportshub.data.Load
@@ -157,6 +161,9 @@ private fun App(vm: SportsViewModel, settings: AppSettings, open: OpenRequest?, 
         }
     }
 
+    // Asked in the same tap that follows a match, as everywhere alerts are turned on.
+    val gate = rememberNotificationGate(onGranted = { vm.syncAlerts() })
+
     BackHandler(enabled = screen != Screen.HOME) {
         screen = if (screen == Screen.ABOUT) Screen.SETTINGS else Screen.HOME
     }
@@ -188,6 +195,16 @@ private fun App(vm: SportsViewModel, settings: AppSettings, open: OpenRequest?, 
                         IconButton(onClick = { screen = Screen.SETTINGS }) {
                             Icon(Icons.Filled.Settings, contentDescription = "Settings")
                         }
+                    }
+                    // Follow this one match: overs, wickets with who and how, the chase, the result.
+                    val m = match
+                    if (screen == Screen.MATCH && m != null && m.state != MatchState.RESULT) {
+                        val following = AlertScheduler.followsCricket(settings, m.id, m.isIndia)
+                        val coveredByIndia = settings.cricketAlerts && m.isIndia
+                        AlertBell(following, m.teams.joinToString(" v ") { it.abbr }, onToggle = { on ->
+                            vm.followMatch(m.id, on, coveredByIndia)
+                            if (on) gate.ensure()
+                        })
                     }
                 },
             )

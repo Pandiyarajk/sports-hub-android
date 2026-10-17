@@ -285,6 +285,37 @@ class ScorecardParseTest {
     }
 
     @Test
+    fun `a chase shows both innings, with the first one's real total, not stale matchcards`() {
+        // Live, Oct-17-2026: BAN 37/0 chasing 272. Matchcards held only ZIM, frozen at 236/8 (46.3).
+        val card = parseScorecard(fixture("cricket_summary_chase.json"))
+        assertEquals(listOf(1, 2), card.innings.map { it.number })
+        val zim = card.innings[0]
+        assertEquals("Zimbabwe", zim.team)
+        assertEquals("271/8", zim.runs)
+        assertEquals("(50 ov)", zim.total.replace(".0", ""))
+        assertEquals("7 (lb 2, w 5)", zim.extras)
+        val ban = card.innings[1]
+        assertEquals("Bangladesh", ban.team)
+        assertTrue(ban.batting.isNotEmpty())
+        assertTrue(ban.extras.startsWith("8 ("))
+        assertTrue(card.live!!.requiredRate.isNotBlank())
+    }
+
+    @Test
+    fun `a chase line gets the balls left from the feed's own score string`() {
+        fun c(summary: String, score: String) = com.pandiyarajk.sportshub.data.cricket.chaseLine(summary, score)
+        assertEquals(
+            "Bangladesh require 235 runs from 268 balls",
+            c("Bangladesh require 235 runs", "37/0 (5.2/50 ov, target 272)"),
+        )
+        // Rain-reduced to 9 overs.
+        assertEquals("India need 20 runs from 9 balls", c("India need 20 runs", "70/3 (7.3/9 ov, target 90)"))
+        assertEquals("West Indies won toss & fielded", c("West Indies won toss & fielded", "37/0 (5.2/50 ov, target 272)"))
+        assertEquals("Need 5 from 3 balls", c("Need 5 from 3 balls", "1/0 (0.3/1 ov, target 6)"))
+        assertEquals("Bangladesh require 235 runs", c("Bangladesh require 235 runs", "37/0 (5.2/50 ov)"))
+    }
+
+    @Test
     fun `overs convert to balls`() {
         assertEquals(34, com.pandiyarajk.sportshub.data.cricket.oversToBalls("5.4"))
         assertEquals(30, com.pandiyarajk.sportshub.data.cricket.oversToBalls("5"))
