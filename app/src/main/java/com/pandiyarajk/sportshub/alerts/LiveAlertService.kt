@@ -1,6 +1,7 @@
 // Author: Pandiyaraj Karuppasamy
 // Date: Oct-17-2026
-// Modified: Oct-17-2026 (a failed poll is not "nothing live"; guarded loop; watchdog re-armed each turn)
+// Modified: Oct-17-2026 (a failed poll is not "nothing live"; guarded loop; watchdog re-armed each turn;
+//   wicket alerts name the dismissal; score with the over limit)
 
 package com.pandiyarajk.sportshub.alerts
 
@@ -14,7 +15,10 @@ import androidx.core.app.NotificationManagerCompat
 import androidx.core.app.ServiceCompat
 import com.pandiyarajk.sportshub.appContainer
 import com.pandiyarajk.sportshub.data.AppSettings
+import com.pandiyarajk.sportshub.data.alerts.Alert
 import com.pandiyarajk.sportshub.data.alerts.AlertEngine
+import com.pandiyarajk.sportshub.data.alerts.AlertKind
+import com.pandiyarajk.sportshub.data.cricket.wicketBalls
 import com.pandiyarajk.sportshub.data.alerts.CricketLive
 import com.pandiyarajk.sportshub.data.alerts.FootballLive
 import com.pandiyarajk.sportshub.data.alerts.parseCricketLive
@@ -160,11 +164,12 @@ class LiveAlertService : Service() {
                 readSomething = true
                 board.filter { it.matchId in indiaTargets && it.matchId !in settings.mutedMatches }.forEach { m ->
                     AlertEngine.cricket(cricketSeen[m.matchId], m, settings.everyOver)
+                        .map { a -> if (a.kind == AlertKind.WICKET) withDismissal(a, leagueId) else a }
                         .forEach { AlertNotifier.post(this, it) }
                     cricketSeen[m.matchId] = m
                     if (m.state == MatchState.LIVE) {
                         live = true
-                        following += m.batting?.let { b -> "${b.team} ${b.runs}/${b.wickets} (${b.oversText})" } ?: m.title
+                        following += m.batting?.display ?: m.title
                     }
                     if (m.state == MatchState.RESULT) indiaTargets = indiaTargets - m.matchId
                 }
@@ -175,6 +180,27 @@ class LiveAlertService : Service() {
             !readSomething -> null
             else -> indiaStarts.any { it in (now - LATE_START_MILLIS)..(now + EARLY_MILLIS) }
         }
+    }
+
+    /**
+     * Who was out and how: the scoreboard only says a wicket fell, so on a wicket the summary
+     * (one fetch per wicket, not per poll) is read for the dismissals, written out as "Abhishek
+     * Sharma 6 (4) caught by Joseph, bowled by Keemo Paul" (stumped by, run out by, lbw and
+     * bowled likewise). Several wickets between polls name each, latest last. Any failure leaves
+     * the alert as it was.
+     */
+    private suspend fun withDismissal(alert: Alert, leagueId: String): Alert {
+        val fell = alert.title.substringBefore(" WICKETS!", "1").toIntOrNull() ?: 1
+        val lines = try {
+            wicketBalls(appContainer.fetch(get(CricketRepository.summaryUrl(leagueId, alert.matchId))))
+                .takeLast(fell).map { it.alertText }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            emptyList()
+        }
+        if (lines.isEmpty()) return alert
+        return alert.copy(text = (lines + alert.text).filter { it.isNotBlank() }.joinToString("\n"))
     }
 
     /** True while a followed EPL match is live or about to kick off; null when the day could not be read. */

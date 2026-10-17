@@ -15,7 +15,16 @@ data class Batting(
     val oversDone: Int,
     /** The overs exactly as the feed gives them, such as 35.5, for display. */
     val oversText: String,
-)
+    /**
+     * The feed's own score string, such as "14/1 (1/9 ov)" or "166/4 (35.5/50 ov, target 257)":
+     * it carries the over limit, which a reduced match changes (9 overs after rain), and the
+     * target. Shown as given; blank when the feed has none.
+     */
+    val scoreText: String = "",
+) {
+    /** "IND 14/1 (1/9 ov)", falling back to the numbers when the feed gives no score string. */
+    val display: String get() = "$team " + scoreText.ifBlank { "$runs/$wickets ($oversText ov)" }
+}
 
 /** One live cricket match as the alert engine sees it, taken from the per-league scoreboard. */
 data class CricketLive(

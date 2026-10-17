@@ -106,4 +106,11 @@ data class LivePanel(
     val thisOver: List<String>,
 )
 
-data class Scorecard(val innings: List<Innings>, val live: LivePanel? = null)
+data class Scorecard(
+    val innings: List<Innings>,
+    val live: LivePanel? = null,
+    /** Batter name to full dismissal ("c Joseph b Paul"), kept across polls by the repository. */
+    val dismissals: Map<String, String> = emptyMap(),
+    /** Batters out with only a code ("c") known; filled from the play-by-play. */
+    val unresolved: Set<String> = emptySet(),
+)
