@@ -62,6 +62,16 @@ class IndiaFilterTest {
     }
 
     @Test
+    fun `international matches sit above club leagues, even a live club match`() {
+        val clubLive = match("club", "Big Bash League", MatchState.LIVE, listOf(team("Sixers", "SYS"), team("Heat", "BRH")))
+        val intlResult = match("intl", "ICC Men's T20 World Cup", MatchState.RESULT, listOf(team("Canada", "CAN"), team("Nepal", "NEP")))
+        val intlUpcoming = match("soon", "Zimbabwe tour of Bangladesh", MatchState.UPCOMING, listOf(team("Zimbabwe", "ZIM"), team("Bangladesh", "BAN")))
+        assertEquals(listOf("soon", "intl", "club"), IndiaFilter.order(listOf(clubLive, intlResult, intlUpcoming), indiaFirst = false).map { it.id })
+        assertFalse(clubLive.isInternational)
+        assertTrue(match("wtc", "World Test Championship", MatchState.LIVE, emptyList()).isInternational)
+    }
+
+    @Test
     fun `with india first turned off, india sorts like any other match`() {
         val liveElsewhere = match("a", "League 2", MatchState.LIVE, listOf(team("Canada", "CAN"), team("Nepal", "NEP")))
         val indiaUpcoming = match("b", "Tour", MatchState.UPCOMING, listOf(team("India", "IND"), team("West Indies", "WI")))

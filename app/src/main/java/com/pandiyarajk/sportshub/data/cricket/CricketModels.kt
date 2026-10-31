@@ -1,5 +1,6 @@
 // Author: Pandiyaraj Karuppasamy
 // Date: Oct-17-2026
+// Modified: Oct-31-2026 (isInternational)
 
 package com.pandiyarajk.sportshub.data.cricket
 
@@ -37,6 +38,9 @@ data class CricketMatch(
 ) {
     /** 5th T20I . Bengaluru, as the card header shows it. */
     val labelAndCity: String get() = listOf(label, city).filter { it.isNotBlank() }.joinToString(" · ")
+
+    /** National teams against each other, not a franchise or domestic side. */
+    val isInternational: Boolean get() = IndiaFilter.isInternational(league, teams)
 
     /** A finished match with a declared winner, so the other side can be shown dimmed. */
     val hasWinner: Boolean get() = state == MatchState.RESULT && teams.any { it.winner }

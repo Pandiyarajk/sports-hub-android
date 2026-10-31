@@ -30,6 +30,8 @@ Multi-sport scores for Android, one tab per sport.
 - Match cards in the ESPNcricinfo style: status, match and city ("5th T20I · Bengaluru"), team flags and
   scores exactly as the feed gives them ("166/4 (35.5/50 ov, target 257)").
 - **India first**: India's matches sit in a full-width strip at the top (a setting turns this off).
+- **Countries before clubs**: on every filter, matches between national sides come above club and
+  league matches (IPL, Big Bash and the like), then live, upcoming and results within each group.
 - **Filter chips** with counts: All, Live, India, Results.
 - **Upcoming matches** show the start day and time in your own time zone and a live countdown
   ("Starts in 31 min").
