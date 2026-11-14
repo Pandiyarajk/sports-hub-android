@@ -61,7 +61,7 @@ Multi-sport scores for Android, one tab per sport.
 
 ### Live alerts (off until you turn them on)
 
-- **India cricket**: an update at the end of every over (optional), and alerts for every wicket, a new
+- **India cricket** (only when the India team plays; Ranji, IPL and other state or league matches stay silent unless you bell them): an update at the end of every over (optional), and alerts for every wicket, a new
   innings, a rain delay or other stop and the restart, and the result. "WICKET! IND 45/3 (6.2 ov)", "End of over 6: IND 49/1 (6 ov) · 9 runs".
 - **Premier League**: goals with the scorer and minute ("GOAL! ARS 0-1 CHE · Cole Palmer (pen) 23'"),
   kick-off, half-time, full-time, and disallowed goals. All matches, or only your highlighted club.

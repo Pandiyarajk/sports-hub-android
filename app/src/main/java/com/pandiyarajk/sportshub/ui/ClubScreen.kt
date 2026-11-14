@@ -1,5 +1,6 @@
 // Author: Pandiyaraj Karuppasamy
 // Date: Oct-17-2026
+// Modified: Nov-03-2026 (fixture rows show the full team name, word-wrapped, never cut)
 
 package com.pandiyarajk.sportshub.ui
 
@@ -21,7 +22,6 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
-import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.pandiyarajk.sportshub.data.football.FootballData
 import com.pandiyarajk.sportshub.data.football.Fixture
@@ -89,8 +89,6 @@ private fun FixtureLine(f: Fixture) {
                     f.home.name,
                     Modifier.weight(1f),
                     textAlign = TextAlign.End,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
                 )
                 Logo(f.home.logo, 20.dp, Modifier.padding(horizontal = 6.dp))
                 Text(
@@ -100,7 +98,7 @@ private fun FixtureLine(f: Fixture) {
                     modifier = Modifier.width(52.dp),
                 )
                 Logo(f.away.logo, 20.dp, Modifier.padding(horizontal = 6.dp))
-                Text(f.away.name, Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Text(f.away.name, Modifier.weight(1f))
             }
         }
     }

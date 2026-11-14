@@ -68,7 +68,7 @@ object AlertScheduler {
         if (settings.anyCricket) {
             runCatchingNonCancel {
                 parseCricketHeader(container.fetch(get(CricketRepository.HEADER_URL)))
-                    .filter { followsCricket(settings, it.id, it.isIndia) }
+                    .filter { followsCricket(settings, it.id, it.indiaPlays) }
                     .forEach { m ->
                         when (m.state) {
                             MatchState.LIVE -> liveNow = true

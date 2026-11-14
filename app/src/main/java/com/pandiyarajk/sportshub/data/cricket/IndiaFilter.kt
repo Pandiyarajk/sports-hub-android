@@ -1,6 +1,7 @@
 // Author: Pandiyaraj Karuppasamy
 // Date: Oct-17-2026
 // Modified: Oct-31-2026 (international matches ahead of club leagues)
+// Modified: Nov-14-2026 (isIndiaTeam: alerts follow the India team only, not Indian leagues)
 
 package com.pandiyarajk.sportshub.data.cricket
 
@@ -15,10 +16,13 @@ object IndiaFilter {
         RegexOption.IGNORE_CASE,
     )
 
+    /** The India national side (men, women, A, Under-19) is one of the teams. League names do not count. */
+    fun isIndiaTeam(teams: List<CricketTeam>): Boolean =
+        teams.any { it.abbr.uppercase() in indiaAbbrs || it.name.startsWith("India", ignoreCase = true) }
+
     /** India is playing, or the series is Indian (a tour of India, the IPL, the Ranji Trophy). */
     fun isIndia(league: String, teams: List<CricketTeam>): Boolean =
-        teams.any { it.abbr.uppercase() in indiaAbbrs || it.name.startsWith("India", ignoreCase = true) } ||
-            indiaLeague.containsMatchIn(league)
+        isIndiaTeam(teams) || indiaLeague.containsMatchIn(league)
 
     private val countries = Regex(
         "^(India|Australia|England|Pakistan|South Africa|New Zealand|Sri Lanka|Bangladesh|West Indies|Zimbabwe|Afghanistan|" +

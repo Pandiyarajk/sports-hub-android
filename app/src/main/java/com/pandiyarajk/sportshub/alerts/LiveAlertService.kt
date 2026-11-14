@@ -159,8 +159,8 @@ class LiveAlertService : Service() {
         if (now - indiaCheckedAt > HEADER_EVERY_MILLIS || indiaTargets.isEmpty() || newlyFollowed) {
             safely {
                 val all = parseCricketHeader(fetch(get(CricketRepository.HEADER_URL)))
-                indiaIds = all.filter { it.isIndia }.map { it.id }.toSet()
-                val india = all.filter { AlertScheduler.followsCricket(settings, it.id, it.isIndia) }
+                indiaIds = all.filter { it.indiaPlays }.map { it.id }.toSet()
+                val india = all.filter { AlertScheduler.followsCricket(settings, it.id, it.indiaPlays) }
                 indiaTargets = india.filter { it.state != MatchState.RESULT }.associate { it.id to it.leagueId }
                 indiaStarts = india.filter { it.state == MatchState.UPCOMING }.mapNotNull { parseMillis(it.startIso) }
                 indiaCheckedAt = now
