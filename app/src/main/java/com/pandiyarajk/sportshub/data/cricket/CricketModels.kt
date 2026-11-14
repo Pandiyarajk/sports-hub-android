@@ -39,6 +39,9 @@ data class CricketMatch(
     /** 5th T20I . Bengaluru, as the card header shows it. */
     val labelAndCity: String get() = listOf(label, city).filter { it.isNotBlank() }.joinToString(" · ")
 
+    /** The India team itself plays. Alerts use this, so Ranji and other state matches stay silent. */
+    val indiaPlays: Boolean get() = IndiaFilter.isIndiaTeam(teams)
+
     /** National teams against each other, not a franchise or domestic side. */
     val isInternational: Boolean get() = IndiaFilter.isInternational(league, teams)
 

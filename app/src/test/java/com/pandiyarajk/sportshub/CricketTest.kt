@@ -46,6 +46,14 @@ class IndiaFilterTest {
     }
 
     @Test
+    fun `alerts follow the india team only, not state or league matches`() {
+        val state = listOf(team("Mumbai", "MUM"), team("Delhi", "DEL"))
+        assertFalse(match("r", "Ranji Trophy", MatchState.LIVE, state).indiaPlays)
+        assertFalse(match("i", "Indian Premier League", MatchState.LIVE, state).indiaPlays)
+        assertTrue(match("t", "Some Tri-Series", MatchState.LIVE, listOf(team("India", "IND"), team("Nepal", "NEP"))).indiaPlays)
+    }
+
+    @Test
     fun `west indies alone is not india`() {
         assertFalse(IndiaFilter.isIndia("Caribbean Premier League", listOf(team("West Indies", "WI"), team("Nepal", "NEP"))))
         assertFalse(IndiaFilter.isIndia("ICC World Cup League 2", listOf(team("Canada", "CAN"), team("Nepal", "NEP"))))

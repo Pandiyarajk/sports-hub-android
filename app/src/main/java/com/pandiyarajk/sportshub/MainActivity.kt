@@ -199,8 +199,8 @@ private fun App(vm: SportsViewModel, settings: AppSettings, open: OpenRequest?, 
                     // Follow this one match: overs, wickets with who and how, the chase, the result.
                     val m = match
                     if (screen == Screen.MATCH && m != null && m.state != MatchState.RESULT) {
-                        val following = AlertScheduler.followsCricket(settings, m.id, m.isIndia)
-                        val coveredByIndia = settings.cricketAlerts && m.isIndia
+                        val following = AlertScheduler.followsCricket(settings, m.id, m.indiaPlays)
+                        val coveredByIndia = settings.cricketAlerts && m.indiaPlays
                         AlertBell(following, m.teams.joinToString(" v ") { it.abbr }, onToggle = { on ->
                             vm.followMatch(m.id, on, coveredByIndia)
                             if (on) gate.ensure()
