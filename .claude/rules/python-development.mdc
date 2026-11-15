@@ -1,0 +1,507 @@
+---
+description: Baseline Python coding standards for any project — naming, reuse-before-writing, exception handling, a docstring on every module/class/function, black formatting and pylint, no secrets, and native-code crashes (C extensions such as PyMuPDF) that try/except cannot catch, so untrusted files are parsed in a child process.
+globs: **/*.py
+alwaysApply: false
+---
+
+<!-- Modified: Nov-15-2026 (one sqlite3 connection shared by many threads) -->
+<!-- Modified: Nov-14-2026 (asyncio subprocess on Windows, scan caching) -->
+<!-- Modified: Nov-15-2026 (cap after the filter, normalised Windows path keys) -->
+
+# Python Development (core)
+
+Applies to every Python file. Stack-specific overlays (qa-web, web-app,
+pypi-package) add to — never contradict — these.
+
+## Standards
+- **Follow the existing module's style first** — mirror the imports, naming and
+  structure of sibling files before introducing anything new.
+- Use meaningful, explicit names. Helpers are verbs (`create_*`, `get_*`,
+  `validate_*`, `build_*`, `load_*`).
+- **Reuse before writing.** Search the codebase for an existing helper before
+  adding a new one. Do not duplicate logic.
+- Keep functions small and single-responsibility.
+- Target Python 3.11+. Prefer `from __future__ import annotations` and PEP 604
+  unions (`str | None`, not `Optional[str]`) in new code.
+- Group imports: stdlib, third-party, local — separated by blank lines.
+- Use `.get("key", default)` when reading external/config data so a missing key
+  has a safe fallback — but note it only guards a **missing** key, not a
+  malformed value. `{"k": ""}.get("k", 0)` returns `""`, so
+  `int(headers.get("X-RateLimit-Limit", 0))` still raises `ValueError` on an
+  empty or non-numeric header. When the value is then coerced, coerce
+  defensively:
+  ```python
+  def _as_int(value, default=0):
+      try:
+          return int(value)
+      except (TypeError, ValueError):
+          return default
+  ```
+
+- **Default an injected object with `is not None`, never `or`.**
+  `self.store = store or Store()` silently replaces an argument that is valid
+  but falsy. A container that defines `__len__` (or `__bool__`) is falsy while
+  it is empty, which is exactly the state a fresh store is in:
+  ```python
+  s = Store()                      # defines __len__, currently empty
+  bool(s)                          # False
+  (s or Store()) is s              # False: your object was thrown away
+  (s if s is not None else Store()) is s   # True
+  ```
+  Verified: in a self-healing locator library the recorded baselines went into a
+  private store nobody else could read, and every test still passed. The same
+  hazard applies to `x = arg or default` for `0`, `""` and `[]`.
+
+## Network calls
+- **Every outbound HTTP call gets an explicit `timeout=`.** `requests` has no
+  default timeout: `session.post(url, json=data)` with no `timeout` waits
+  forever if the server accepts the connection and never answers. That is not a
+  slow request, it is a hung process — in a test suite or a CI step it burns the
+  whole job's wall clock with no error to diagnose. Pass a timeout on every
+  `get`/`post`/`put`/`delete`, including the ones inside retry helpers and
+  teardown/logout paths, which are the ones that get missed.
+- Catch `requests.exceptions.Timeout` where a timeout is an expected outcome
+  rather than letting it surface as a generic failure.
+- **Use one `requests.Session` for repeated calls to the same host; never call
+  bare `requests.get` in a loop.** Each bare call opens a new connection, does a
+  full TLS handshake and reloads the CA bundle. Measured Oct-10-2026 (Windows 11,
+  requests 2.34.2, urllib3 2.7.0, 10 calls to api.github.com): bare
+  `requests.get` cost **0.45 s CPU and 0.98 s wall per call**; `Session.get` cost
+  **0.05 s CPU and 0.60 s wall**. In a backfill of thousands of calls, one
+  handshake also spun on CPU inside `ssl_wrap_socket` and stalled the run for 30
+  minutes with no network traffic (`py-spy dump --pid` showed where). With
+  pooled sessions the same job did about 7 calls per second.
+  - `requests.Session` is not documented as thread-safe. Give each worker thread
+    its own session through `threading.local()`, and keep a shared one only for
+    single-threaded code.
+  - Tests that monkeypatch `requests.get` then need to patch the session object
+    instead.
+- **Set an explicit `User-Agent` naming the tool.** "We don't set one" means the
+  library's default goes on the wire, and those are blocked by name: measured
+  Aug-2026, `Python-urllib/3.13` got **HTTP 403 `error code: 1010`** from a
+  Cloudflare-fronted portal and `python-requests/2.32.3` got a **406** from a
+  ModSecurity host, where a `mytool/0.1 (+url)` UA reached the application on
+  both. `urllib` adds its default at send time, so `Request.get_header("User-agent")`
+  returns `None` while the header is still sent — the UA line is load-bearing,
+  not decoration. Say so in a comment so a cleanup doesn't delete it.
+- **A WAF block page is not empty data.** It arrives as valid HTML (226 bytes,
+  `curl` exit 0), so parsers report "nothing found" instead of "refused". Guard
+  the fetch boundary on body size plus block markers and raise. Diagnosis and
+  the escalation order are in
+  [waf-blocked-scraper](../../skills/waf-blocked-scraper/SKILL.md).
+
+## Exception handling
+- Catch specific exceptions where practical; a broad `except Exception as err:`
+  is acceptable only when it logs meaningfully and does not swallow the error
+  silently.
+- Do **not** write bare `except:` or re-raise raw stack traces to users.
+- Do **not** use `print()` for diagnostics in library/app code — use `logging`.
+
+## Docstrings
+- **Every file starts with a module docstring** carrying the Author/Date header
+  (see [authorship-header](authorship-header.mdc)); every class has one too.
+- **Every function and method has a docstring directly under its `def`**,
+  private helpers included (pylint C0114/C0115/C0116 stay on).
+- **Public functions/methods** get a full docstring: one-line summary, then
+  typed `Args:` / `Returns:` / `Raises:` (Google style). Type each parameter;
+  mark optionals; give the return type and meaning (omit Returns for `None`).
+- **Small internal helpers and thin wrappers** may use a single action-focused
+  line describing what the code does.
+
+## Formatting and linting: black and pylint
+- **Format with black** (`python -m black <files>`) before committing. Use the
+  repo's `[tool.black]` line length if set, otherwise black's default (88).
+  Format only the files the change touches, so a diff is not buried in
+  reformatting.
+- **Lint with pylint** (`python -m pylint <files>`) using the repo's pylintrc,
+  or [templates/common/pylintrc.ini](../../templates/common/pylintrc.ini) when
+  it has none, and fix what it reports. flake8/ruff, where a repo already runs
+  them, keep running alongside.
+- Never add C0114, C0115, C0116, W0102 (mutable default), W0702 (bare except),
+  E0602 (undefined name), E0102 (redefinition) or W0612 (unused variable) to
+  `disable`: each one enforces a rule written in this file. A line-level
+  `# pylint: disable=<code>` needs a comment saying why. Measured Nov-09-2026
+  (pylint 4.0.4): with those codes disabled, the old template rated a file with
+  a mutable default, a bare `except:` and an undefined name **10.00/10**.
+
+## Linter suggestions that can be wrong
+
+A linter autofix is a suggestion, not a proof. Two that silently change
+behaviour:
+
+- **`sqlite3.Row` membership.** Ruff `SIM118` rewrites
+  `"result" in row.keys()` → `"result" in row`. On a `sqlite3.Row` that
+  inverts the logic: `in` scans **values**, not keys. Verified —
+  `"id" in row.keys()` is `True` while `"id" in row` is `False`, and
+  `"result" in row` is `True` only because `"result"` happens to be a stored
+  value. Keep `.keys()` and mark it `# noqa: SIM118` with a comment saying
+  why, so the next person doesn't "fix" it again.
+- **Ternary rewrites (`SIM108`)** are safe, but only apply them where the
+  result still reads clearly; don't let a linter flatten a branch whose two
+  arms mean genuinely different things.
+
+Before accepting any autofix on logic (as opposed to formatting/imports),
+confirm the rewritten expression means the same thing for the *actual types
+involved*, not just for a plain `dict`/`list`.
+
+## One sqlite3 connection shared by many threads
+
+`sqlite3.connect(..., check_same_thread=False)` only switches off Python's
+guard; it does not make one connection safe for concurrent use. Helm Core
+(Nov-15-2026) kept one such connection for the asyncio thread,
+`asyncio.to_thread` workers and a live poller. After a feature queried the
+database twice per candidate repo (400 repos, so 800 reads per request),
+requests failed intermittently.
+
+- **Symptom.** `sqlite3.InterfaceError: bad parameter or other API misuse`
+  raised at `conn.execute(...)` inside a worker thread, only under load, never
+  on the first call. In the log it is a traceback ending in that line (Core log
+  2026-11-15 20:49:59 and 20:54:26); the phone showed "Core failed to handle the
+  frame". It stopped after the queries were collapsed to 2 per request and
+  reads got the helper below.
+- **Evidence, honestly stated.** The production traceback is the proof; the
+  cause (concurrent use of one connection) is inferred. A first stress run
+  (6 reader threads plus 1 writer, 60 s) did not raise it and hung. A second
+  run on Python 3.13.5 (`:memory:`, same connect flags, 6 readers doing
+  `SELECT ... WHERE a=?` plus 1 inserting writer, 15 s) did raise it: 665
+  `InterfaceError: bad parameter or other API misuse`, plus a few "no more rows
+  available" and "not an error". So it reproduces, but not every run shape does.
+- **Safe options (pick one).**
+  1. One `threading.Lock` around every use of the shared connection, including
+     fetching the rows (the cursor is part of the connection's state).
+  2. A connection per thread, or per call for reads (WAL mode lets readers run
+     beside the writer).
+  3. A single writer thread fed by a queue, with reads on their own connections.
+- **Do not run N queries where one will do.** Batch with an `IN (?,?,...)` list
+  (chunk below 900 parameters) or one grouped query. Many tiny queries multiply
+  the chance of a collision and the lock hold time.
+- **A read must not fail a user-facing request.** Wrap reads in a helper that
+  retries once and degrades to an empty result, logging the error:
+
+  ```python
+  def safe_read(run, retries=1):
+      for attempt in range(retries + 1):
+          try:
+              return run()
+          except sqlite3.Error:
+              log.exception("db read failed (attempt %d)", attempt + 1)
+      return []
+  ```
+  Use it for reads only; a failed write must still surface.
+- **Test idea.** Start 6 reader threads and 1 writer on the store for a few
+  seconds, with daemon threads and `join(timeout)` so a hang fails the test
+  instead of blocking CI, and assert no thread recorded an exception. Run it
+  against the real store class, not a copy of its connect call.
+## Hard prohibitions
+- No hardcoded credentials, tokens, hostnames, ports, connection strings, or
+  environment-specific values. Pull them from config / environment. See
+  [no-secrets](no-secrets.mdc).
+- **No hardcoded absolute repo/checkout paths** (e.g.
+  `r"D:\GitHub\myrepo\..."` or `r"C:\actions-runner\_work\myrepo\myrepo\..."`).
+  A repo is checked out to a different absolute root on every machine and CI
+  runner, so a literal root works on the machine that wrote it and fails
+  silently elsewhere — no exception if the fallback path also doesn't exist,
+  just a skipped step or a wrong file used. Derive the path at runtime from
+  the current file's own location instead:
+  ```python
+  import os
+  repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+  data_path = os.path.join(repo_root, "TestData", "Images")
+  ```
+  walking up from the file to a fixed, known-stable point in the repo layout.
+  When the same path is built at multiple call sites, hoist it to a single
+  module-level constant computed once at import time rather than repeating
+  the `os.path.join` at each site. Verified in a test-automation repo
+  (Sep-2026): 8 files carried a literal `D:\GitHub\<repo>\...` or
+  `C:\actions-runner\_work\<repo>\<repo>\...` root that broke between a dev
+  machine and the GitHub Actions self-hosted runner.
+- No mutable default arguments (`def f(x={})`) in new code.
+
+## Verify
+- Lint / compile touched Python files before declaring done
+  (`python -m py_compile`, then `black --check` and pylint, plus flake8/ruff if
+  configured).
+- **Confirm the linter actually ran.** A config that fails to load makes the
+  linter exit before reading a file, which is indistinguishable from a clean
+  run — `cd <repo> && flake8 --version` parses the config and is the cheap
+  check. See [lint-config-integrity](lint-config-integrity.mdc), which also
+  lists the codes that must never be added to `ignore` because a hub rule
+  states the opposite.
+
+## `python -I` hides `pip install --user` packages
+Isolated mode (`-I`) implies `-s`: the user site-packages directory
+(`%APPDATA%\Python\Python3xx\site-packages` on Windows) is left off `sys.path`.
+A package installed with `pip install --user` then imports fine with plain
+`python` and fails with `ModuleNotFoundError` under `python -I`, straight after a
+successful install, which reads as a broken install and invites a pointless
+reinstall. `-I` is the right call for a script that reads untrusted files
+(it also drops the script's directory and `PYTHON*` variables from the
+search), so keep it there; just do not use it by habit for your own tools. When
+an import fails under `-I`, run the same import without it before reinstalling.
+Verified Oct-18-2026, Python 3.13: after `pip install --user telethon==1.40.0`,
+`python -I -c "import telethon"` raised `ModuleNotFoundError` and
+`python -c "import telethon"` loaded it from `AppData\Roaming\Python\Python313`.
+Reproduce: `python -c "import site; print(site.ENABLE_USER_SITE)"` prints `True`,
+`python -I -c "import site; print(site.ENABLE_USER_SITE)"` prints `False`.
+
+## Console output
+Any script that prints a non-ASCII character (`→`, `·`, `—`, `…`) can raise
+`UnicodeEncodeError` on a `cp1252` Windows console *after* its work has already
+succeeded, exiting non-zero with a correct output file on disk. Reconfigure
+stdout/stderr at the entry point — see
+[console-output-encoding](console-output-encoding.mdc).
+
+## When a fix depends on a package, record the version that fixed it
+
+Installing something to make a failure go away is half the work. The other half
+is writing down *what* was installed, at *which* version, and *what the failure
+looked like* — otherwise the next clone reproduces the failure and the next
+reader has no way to connect the two.
+
+When a fix is "install X" or "upgrade X", record all three:
+
+1. **The exact version that was verified**, not a range and not "latest".
+   `pip -q install X` then `python -c "from importlib.metadata import version;
+   print(version('X'))"` — read it back rather than trusting what you typed,
+   because a resolver can install something other than what was asked for.
+2. **The symptom it fixes, in the words the failure actually uses.** This is
+   the part that gets skipped and the part that pays. A missing package rarely
+   announces itself: an optional extra that some dependency imports *eagerly*
+   fails at import with the name of the **transitive** package, so the error
+   reads like an unrelated environment problem rather than a missing extra.
+   Measured case: without SQLAlchemy, APScheduler's job store raised
+   `ModuleNotFoundError: No module named 'sqlalchemy'` and failed fifteen tests
+   at collection — naming neither APScheduler nor the `[schedule]` extra that
+   was actually absent. Someone reading only the traceback installs the wrong
+   thing or shrugs at it for weeks.
+3. **Where a reader will look**: the repo's `CLAUDE.md` for a standing
+   environment fact, `CHANGELOG.md` for the change itself. "Tests need
+   `pip install -e .[schedule]`" belongs next to the test command, not in a
+   commit message nobody greps.
+
+State plainly what still works without it. "Sending is unaffected; `schedule`,
+`jobs`, `daemon` and `run-due` cannot start" tells a reader whether they need it
+at all, where "install the extra" does not.
+
+## Dev environments: pin what you verified, without pinning what you ship
+
+A **library** states ranges in `pyproject.toml`. Pinning a library's
+dependencies exactly makes it uninstallable beside anything else that pins
+differently, so ranges are not laziness there, they are the contract.
+
+That leaves nothing recording what a green run was actually measured against.
+A `requirements.txt` alongside is the complement, not a second source of truth:
+
+```
+# Exact versions one full green run was measured against.
+# pyproject.toml stays the source of truth for what this DEPENDS on.
+# Verified on Python 3.13.5, Windows 11: 170 passed.
+httpx==0.28.1
+apscheduler==3.11.0
+sqlalchemy==2.0.54
+pytest==8.4.1
+```
+
+- Say in the header which file wins, or the two drift into disagreement and
+  nobody knows which to believe.
+- Record the **interpreter and OS** the run happened on, and the result. "170
+  passed" dates the claim; "should work" does not.
+- Include the optional extras the *tests* need even when the shipped package
+  does not need them, since that is exactly the gap that produces import-time
+  failures on a clean clone.
+- Keep it out of the sdist `include` list — it is a repo artifact, not part of
+  the distribution.
+- Application (non-library) repos are the opposite case: pin in the manifest
+  itself, because there is nothing downstream to be compatible with.
+
+## `os.kill(pid, 0)` is not "is this process alive" on Windows
+
+On POSIX, `os.kill(pid, 0)` is the classic liveness probe. On Windows it is a different
+call: signals 0 and 1 are `CTRL_C_EVENT` and `CTRL_BREAK_EVENT`, console events that
+only make sense for processes sharing your console. A check built on it gets the answer
+wrong in the dangerous direction.
+
+Measured Oct-18-2026 (Python 3.13.5, Windows 11), against a process started by another
+program, so not our child and not in our console or process group:
+
+| Probe | Live independent process | Killed process |
+|---|---|---|
+| `os.kill(pid, 0)` | **raises `OSError` winerror 87** (reads as "dead") | raises `OSError` winerror 87 |
+| `OpenProcess` + `GetExitCodeProcess` | alive | not alive |
+
+So a stale-claim check that treated the exception as "process is gone" would take over
+work that another live process was still running. (For a *child* of the current process
+the call can return normally even after the child exited, because the parent still holds
+a handle, so a quick test against your own child proves nothing either.)
+
+```python
+def pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if sys.platform == "win32":
+        k = ctypes.WinDLL("kernel32", use_last_error=True)
+        k.OpenProcess.restype = wintypes.HANDLE
+        k.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        k.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        k.CloseHandle.argtypes = [wintypes.HANDLE]
+        handle = k.OpenProcess(0x1000, False, pid)           # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            return ctypes.get_last_error() == 5              # access denied: it exists
+        try:
+            code = wintypes.DWORD()
+            return bool(k.GetExitCodeProcess(handle, ctypes.byref(code))) and code.value == 259  # STILL_ACTIVE
+        finally:
+            k.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+```
+
+Test it against an independent process (start one through PowerShell `Start-Process`, or
+any launcher that is not your own `subprocess`), then `taskkill` it and test again. Check
+that the probe process really is running before you trust the result: `tasklist /FI "PID eq N"`.
+An earlier run of this experiment passed its arguments to `Start-Process` without quoting,
+the probe process died at once, and the "dead" reading looked like a finding.
+
+## A native-code crash is not an exception
+
+A library written in C or C++ (PyMuPDF/MuPDF, lxml, Pillow codecs, numpy extensions) can
+crash the interpreter outright. `try`/`except` never runs, no traceback is printed, and
+whatever process was parsing is gone; in a server that is the server. It looks exactly
+like an out-of-memory kill.
+
+Seen Nov-02-2026: force-indexing long PDFs restarted a RAG service three times with no
+error in its log. The cause was two damaged ISO PDFs: opened locally, PyMuPDF printed
+`cannot parse indirect reference in array` 17 times and the Python process vanished. The
+files next to them in the same batches were fine.
+
+Verified Nov-02-2026 (Python 3.13 on Windows 11, 3.12 on Linux), with a real fault
+(`faulthandler._sigsegv()` inside `try: ... except BaseException:`) run as a child:
+
+| Platform | Child exit code | `except` ran | Line after it ran |
+|---|---|---|---|
+| Windows | 3 | no | no |
+| Linux | -11 (SIGSEGV) | no | no |
+
+One exception to know about: on Windows, `ctypes.string_at(0)` is converted to a
+catchable `OSError`, so a test built on that "proves" the crash can be caught. A real
+fault inside a C extension is not converted.
+
+- **Parse untrusted files with C-backed libraries in a child process** (`subprocess`, or
+  `multiprocessing` with a fresh process per file) before the long-lived service touches
+  them, running the same operations the service will run (for PDFs: open, per-page table
+  detection and text extraction).
+- **Judge "clean" by the child's exit code**, not by the absence of a Python error, and
+  give the child a timeout.
+- **Process suspect files one per job.** In a batch, the crash hides which file caused
+  it; one file per job names it. The run above indexed the next 27 heavy PDFs this way
+  with no restarts.
+
+## Do not write source files through a shell heredoc if the text has backslashes
+
+A Python patch script piped through a heredoc lost a level of backslash in this
+environment (Claude Code's Bash tool), even with a quoted delimiter. Measured Oct-18-2026:
+a script containing `src = "x = '\\n'"` (backslash backslash n, meaning "write backslash n
+to the file") held a real newline character instead, and the `\n` inside an f-string
+landed in the file as a line break:
+
+```
+    print(f"
+First connection to {host}.")        # pyflakes: unterminated f-string literal
+```
+
+It happened three times in one session: two of them produced a syntax error that only
+the linter showed, and one a `SyntaxError: (unicode error) 'unicodeescape'` from a
+Windows path in the patch script's own string (`\unzipped`). The same mechanism wrote
+`\b` regex escapes as backspace bytes (see `testing.mdc`, "A regex with alternatives").
+
+- Write the patch as a **file** with the editor's Write tool and run it, or use the Edit
+  tool directly. Both write exactly the bytes you typed.
+- In a patch script that must contain backslashes, use raw strings and `assert text.count(old) == 1`
+  before every replace, so a miss fails loudly instead of editing nothing.
+- Run `python -m pyflakes` and scan the touched files for control bytes after any scripted edit.
+
+## Windows: do not leave an asyncio subprocess to be cancelled
+
+Seen Nov-14-2026 in Helm (`bridge/src/helm_core/repos.py`, Python 3.13, Windows 11). A
+background task ran `git` with `asyncio.create_subprocess_exec` and `asyncio.wait_for`. When
+the task was cancelled, or the loop was closing, the process never exited and `asyncio.run`
+hung forever inside `_cancel_all_tasks` (faulthandler stack: `windows_events.py _poll` under
+`runners.py _cancel_all_tasks`). Calling `kill()` in a `CancelledError` branch did not help.
+The repro (`scratchpad/repos_hang.py`) exits 0 after the fix.
+
+- Run the command with `subprocess.run(..., timeout=N)` in a worker thread
+  (`await asyncio.to_thread(_run_sync, ...)`). The timeout is hard and a cancelled task only
+  abandons the thread.
+- Pass `creationflags=subprocess.CREATE_NO_WINDOW` on Windows. Under `pythonw` every
+  console child (`git`) otherwise flashes a console window.
+- To find where a process hangs at exit, start it with
+  `faulthandler.dump_traceback_later(25, exit=True)`: it prints every thread's stack and exits.
+
+## A UI must never wait for a directory scan
+
+Helm's repo picker ran 3 `git` processes per repo over about 100 repos: slow and noisy.
+
+- Ask once per repo: `git log -1 --format=%ct%x00%s%x00%D` gives commit time, subject and
+  branch (from `HEAD -> name` in `%D`).
+- Slow calls such as `git status` go in a separate background pass.
+- Keep the result in memory and in a file, rescan on a schedule (hourly), and answer from the
+  cache at once (stale-while-revalidate). Fewer processes per item beats a faster process.
+
+## A cap goes after the filter, never on the raw scan order
+
+Seen Nov-15-2026 in Helm Core. `candidate_repos()` took the git folders directly under the
+repo root in directory order and stopped at `MAX_ALL_REPOS = 60`, and only then kept the repos
+with recent activity. The owner has 113 folders, so every repo after "L" in the alphabet was
+dropped without a word: `mobile-ai`, the repo of the live session, was missing from the "All
+repositories" Activity feed while `learn-hindi` showed. It was noticed only because the active
+session itself was absent. The fix raised the cap to 400 and applied the activity filter to
+the candidates first.
+
+- **Filter or rank first, cap last.** A cap on unranked scan order silently discards whatever
+  sorts late, and nothing errors.
+- **Log when a cap truncates** (`logging.warning("capped %d of %d", cap, total)`), so a
+  missing item has a trace.
+- **Test with more items than the cap, and put the wanted item last in scan order.**
+
+```python
+def pick(names, wanted, cap):
+    """Filter first, then cap."""
+    return [n for n in names if wanted(n)][:cap]
+
+names = [f"repo{i:02d}" for i in range(75)] + ["zzz-late"]
+assert "zzz-late" in pick(names, lambda n: n == "zzz-late" or n.endswith("0"), 60)
+assert "zzz-late" not in names[:60]  # the buggy order (cap, then filter) loses it
+```
+
+Helm's regression test is `test_all_repositories_covers_more_than_sixty_repos` in
+`bridge/tests/test_activity_all.py` (mobile-ai repo).
+
+## Windows: compare path keys normalised, everywhere
+
+Seen Nov-15-2026 in Helm Core (`agents.py`). A mission stored its repo as `D:\github\mobile-ai`
+while the roster built its grouping key from a directory scan as `D:\GitHub\mobile-ai`. The
+lookup lowered both sides, but the output filter compared the raw strings, so the running
+mission vanished from the Agents tab until the output used the key's spelling.
+
+- Normalise once into a key (`os.path.normcase`, or `casefold()` plus forward slashes), keep
+  the original only for display, and compare keys in every place, including the final filter.
+- Test with two spellings of the same path.
+
+```python
+import os
+
+def path_key(path):
+    """Case and slash insensitive key for a Windows path."""
+    return os.path.normpath(path).replace("\\", "/").casefold()
+
+assert path_key(r"D:\github\mobile-ai") == path_key("D:/GitHub/mobile-ai/")
+```
+## Tests
+For test isolation from production state files, import-time side effects,
+global-state resets and coverage gates that actually ratchet, see
+[testing](testing.mdc).

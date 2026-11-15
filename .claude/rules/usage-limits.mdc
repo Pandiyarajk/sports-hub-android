@@ -1,0 +1,73 @@
+---
+description: Pause all agent work when Claude usage reaches 98 % of the 7-day weekly limit or 96 % of the 5-hour session limit. Check before starting agents or workflows, keep a usage guard running during long work, and stop every agent, workflow and scheduled job the moment it trips.
+globs: **/*
+alwaysApply: true
+---
+
+<!--
+Author: Pandiyaraj Karuppasamy
+Date: Nov-07-2026
+Modified: Nov-14-2026 (98 % weekly and 96 % session, per-window flags, credential-free /usage source, allowed_warning semantics, credentials note)
+-->
+
+# Usage Limits
+
+**Pause everything at 98 % of the 7-day weekly window or 96 % of the 5-hour session window**,
+whichever gets there first. The two lines differ on purpose (changed Nov-14-2026; it used to be
+98 % for both): each window is compared with its own line, never one number against both. The rest
+is how to make sure that happens.
+
+- **Per-window evaluation.** `usage_guard.py` takes `--limit` (weekly, default 0.98) and
+  `--session-limit` (5-hour session, default 0.96); `over_limit(values, limit, session_limit)`
+  tests each window against its own line. Check: 5h 97 % / week 97 % pauses (session over 96);
+  5h 95 % / week 97 % stays open; 5h 95 % / week 99 % pauses (weekly over 98).
+- **A tool with its own gate exposes both lines.** Helm Core
+  (`bridge/src/helm_core/usage.py` `evaluate_gate(..., pause_at, pause_five_at)`; config
+  `gate_no_new_at`, `gate_pause_at` for weekly, `gate_pause_session_at` for the session) is the
+  model: one setting per window, not a single shared pause value, both defaulting to these lines.
+  Show both in its UI and settings, and test the three cases above.
+
+- **Measure, never guess.** Read usage from the claudehub monitor (`GET /api/usage` on
+  `http://127.0.0.1:7070`, both windows as fractions), most simply with
+  `python D:\GitHub\tools\usage-guard\usage_guard.py --once`. Do this before starting subagents,
+  a workflow, or any other fan-out.
+- **Credential-free source: `/usage`.** Sent as the prompt to `claude -p` (no
+  `--disable-slash-commands`, which makes it reply "isn't available"), it runs locally at zero
+  tokens and prints `Current session: NN% used ...` (5-hour) and
+  `Current week (all models): NN% used ...` (7-day):
+  `"/usage" | claude -p --setting-sources "" --tools "" --no-session-persistence --output-format text`
+  with `ANTHROPIC_API_KEY` unset. Agents in `stream-json` also emit `rate_limit_event` with
+  `rate_limit_info.unifiedWindows.{five_hour,seven_day}.utilization` (fraction 0..1) and
+  `resetsAt` (Unix seconds), though not on every turn. Use these when claudehub is down, and in
+  any new tool. Exact parse lines: `skills/usage-guard`.
+- **`allowed_warning` is a warning, not a limit.** It appeared on the seven-day window at about
+  78 % weekly. Show it as a banner; block only on the 90 % no-new-agents threshold, the pause lines (98 % weekly, 96 % session) or on `rejected`.
+- **Do not read the Claude credentials file to get usage.** claudehub's probe calls the API with
+  the OAuth token from `~/.claude/.credentials.json`; Anthropic's terms
+  (code.claude.com/docs/en/legal-and-compliance) reserve that OAuth for its native apps and bar
+  developers from collecting or intermediating Claude.ai credentials. New tools use the sources
+  above.
+- **At or above either line (98 % weekly, 96 % session) before starting: do not start.** Tell the user both readings and when each
+  window resets, and wait for them.
+- **During long or parallel work, keep the guard running** in the background (the Bash tool with
+  `run_in_background`): `python D:\GitHub\tools\usage-guard\usage_guard.py` checks every 2 minutes
+  and exits when the weekly window reaches 98 % or the session window reaches 96 %. One guard per
+  session is enough.
+- **When it trips, pause all, at once:** stop every running workflow and background agent
+  (TaskStop), delete recurring cron jobs (CronDelete) including status tickers, post one final
+  status line if a status channel is in use, and start nothing new. Work already committed and
+  pushed survives; say what was cut off mid-way.
+- **Resume only when the user says so** (or a window has reset and the user asked to continue
+  then). A reset alone is not permission, with one standing exception:
+- **Session pause with weekly under 90 %: resume on the session reset.** When the pause was
+  caused by the 5-hour session reaching 96 % and the weekly reading is under 90 %, wait for the
+  session to reset (`usage_guard.py --wait-session-reset`, exits 0 once the session reads 10 % or
+  less while weekly stays under 90 %), then re-arm the guard and resume the paused work. A weekly
+  pause, or weekly at 90 % or more, still needs the user's word.
+- **Blind is not green.** If the guard cannot read usage (monitor down, login expired), it exits
+  with a "blind" line: stop starting new agents and ask the user, rather than carry on unmeasured.
+  The `/usage` probe can still give the user a reading to decide on.
+- The guard itself costs no Claude usage; a cron prompt every 2 minutes would. Prefer the
+  background guard over a scheduled prompt.
+
+Skill with the step-by-step: `skills/usage-guard`. Tool: `D:\GitHub\tools\usage-guard`.

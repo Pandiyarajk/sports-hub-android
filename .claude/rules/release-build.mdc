@@ -1,0 +1,381 @@
+---
+description: Android release builds : every delivered APK is a signed release (user rule), creating the release key when a repo has none, signing config from a gitignored properties file, naming the APK <appname>_<versionName>.apk (rootProject.name, an underscore), the R8 obfuscation that silently breaks anything persisting an enum name, a persisted key redeclared in a second module so two spellings reach one store, and the permissions a dependency merges into the manifest that only the built APK reveals. Request when enabling minify/R8, configuring release signing, adding or changing a persisted key, auditing what permissions an app actually ships, or when a setting stops taking effect only in release.
+globs: **/build.gradle.kts, **/build.gradle, **/proguard-rules.pro
+alwaysApply: false
+---
+
+<!-- Modified: Nov-15-2026 (APK name back to <appname>_<versionName>.apk with rootProject.name, per the user's global rule) -->
+
+# Android release build (signing and R8)
+
+Sibling of [android-app](android-app.mdc); deployment and on-device verification are in the
+[android-deploy](../../skills/android-deploy/SKILL.md) skill.
+
+A release build fails differently from a debug build: it produces an APK that installs and runs,
+with one feature quietly not working. Both rules below were verified by reading the R8 mapping,
+not by assumption.
+
+## R8 may rename enum constants, and `Enum.name` returns the compiled name
+
+`Enum.name` returns the **compiled** field name. R8 is free to rename those fields, so code that
+persists an enum by name and matches it back can break — silently, with no crash and no log line.
+
+```kotlin
+// Written in debug, works. In release, it.name is "i", never "Wiegand", so every stored
+// override stops matching and quietly falls back to auto-detection.
+DeviceProfile.entries.firstOrNull { it.name == storedOverride }
+```
+
+Verified by building with `proguard-rules.pro` emptied and reading
+`app/build/outputs/mapping/release/mapping.txt`:
+
+```
+without keep rules:  DeviceProfile.Wiegand   -> i
+   with keep rules:  DeviceProfile.Wiegand   -> Wiegand
+```
+
+Keep the constants:
+
+```proguard
+-keepclassmembers enum com.example.data.** {
+    public static **[] values();
+    public static ** valueOf(java.lang.String);
+    **[] $VALUES;
+    public *;
+}
+```
+
+Better still, don't persist `Enum.name` at all — store an explicit stable key (`@SerialName`, or
+an `id` field you control) so the on-disk value is decoupled from the field name. Any reflective
+lookup by name is suspect under R8: enum constants, class names, `Class.forName`.
+
+**The name can reach a key, not just a value — and that version is louder.** The example
+above loses one stored setting. An app that builds *key names* from the enum loses a whole
+namespace at once:
+
+```kotlin
+// Release reads "seen.child1.a" where debug wrote "seen.child1.homework".
+stringSetPreferencesKey("seen.$childId.${feed.name.lowercase()}")
+```
+
+Nothing throws — the read just returns empty. If a *separate* flag records that the app has
+already initialised (`seeded.<child>`, keyed on something R8 did not touch), the two now
+disagree: the app believes it has seen this data before, while every lookup says it has seen
+nothing. One measured consequence was a notification per item across an entire academic
+year — roughly 350 at once — from an app whose whole value was notifying sparingly.
+
+Same fix, and it is a rename with no migration when the key values match what the old code
+produced:
+
+```kotlin
+enum class Feed(val key: String) { HOMEWORK("homework"), NOTICE("notice"), … }
+```
+
+Read it back through a lookup on `key` rather than `valueOf`: a `PendingIntent` or a stored
+record written by the previous version outlives the upgrade, so accept the old spelling too.
+
+### Whether it actually renames is per-project — verify, don't assume either way
+
+A second Kotlin/Compose app (Isai, AGP 8.7.2, `proguard-android-optimize.txt`,
+`isMinifyEnabled` + `isShrinkResources`, **no** enum keep rules) persisted
+`StationCategory.name` into DataStore and matched it back with
+`entries.firstOrNull { it.name == stored }` — the exact shape above — and the names **survived**:
+the release DEX still contains `Talk`. Plausible reason: `.name` is read in the same module, so
+R8 can see the names being observed. That is a hypothesis; only the outcome was verified.
+
+So the two projects disagree, and neither result generalises. Do not conclude "R8 renamed it" or
+"R8 kept it" from experience — the keep rule above costs nothing, and the check below is cheap.
+Storing a key you control sidesteps the question entirely, which is why it stays the advice.
+
+**Do not assume kotlinx-serialization needs keep rules for this.** It does not, and believing
+otherwise is folklore worth not repeating. Its artifacts ship consumer rules, so generated
+serializers survive:
+
+```
+without keep rules:  SavedDevice$$serializer -> x1.K     renamed, NOT stripped
+```
+
+Renaming is harmless there because generated code references the serializer directly rather
+than by name. The enum is the real hazard.
+
+### The explicit key only helps while there is exactly one of it
+
+Replacing `Enum.name` with a key you control fixes the R8 hazard and creates a
+new one: the key is now a value someone can retype. A second declaration of the
+same enum, in a module that cannot see the first, compiles perfectly and writes
+different strings into the same storage. R8 is not involved; this breaks in debug
+too, and the R8 checks above will not catch it.
+
+**Verified case.** A chess app declared `PuzzleModes` in `:app` while the data
+layer already had one. The app's copy spelled a key `"thinkfirst"` where the
+stored value was `"think_first"`, and added a `BY_ID` constant the data layer
+never defined. Everything compiled; the writes went into the user's saved puzzle
+history with keys nothing would ever read back. The module had a `Keys.kt`
+existing for exactly this reason, one import away.
+
+- **Persisted keys live in one module, and every other module imports them.** The
+  module that owns the storage owns the keys; a UI module declaring a storage key
+  is the bug, not the spelling.
+- **Grep before declaring.** `grep -rn "think_first\|PuzzleMode" --include=*.kt`
+  costs seconds and is the only thing that finds a duplicate, since the compiler
+  is happy with both.
+- **A constant with no reader is a signal.** The invented `BY_ID` had no
+  counterpart in the data layer at all, which a "does every key round-trip"
+  test would have caught:
+  ```kotlin
+  @Test fun everyModeKeyIsKnownToTheDataLayer() =
+      PuzzleMode.entries.forEach { assertNotNull(Keys.puzzleMode(it.key)) }
+  ```
+- **Suspect this after parallel work**, the same way as a duplicated constants
+  object: see [testing](../core/testing.mdc#the-same-hazard-without-a-rebuilt-object-two-definitions-of-the-same-constant),
+  where the drawn board colours and the tested ones had forked the same way.
+
+## A library can add a permission you never declared, and only the APK shows it
+
+Manifest merge folds in the `<uses-permission>` entries of every dependency.
+Nothing in your source mentions them, so reading the repo, grepping, and
+reviewing the diff all report a clean manifest while the shipped app asks for
+more than you think.
+
+**Verified case.** An offline Android app whose About screen promised "nothing
+leaves your phone" shipped with `ACCESS_NETWORK_STATE`, `WAKE_LOCK`,
+`RECEIVE_BOOT_COMPLETED` and `FOREGROUND_SERVICE`, all contributed by
+WorkManager for a single unconstrained daily reminder. `ACCESS_NETWORK_STATE`
+directly contradicted the privacy claim. None of the four appeared anywhere in
+the source manifest.
+
+Read the permissions off the **built artifact**, which is the only place they
+exist:
+
+```powershell
+$apk = (Get-Content app\build\outputs\apk\release\output-metadata.json | ConvertFrom-Json).elements[0].outputFile
+aapt2 dump permissions app\build\outputs\apk\release\$apk
+```
+
+Remove the ones you do not use, in the source manifest, with a comment saying
+which dependency contributes each:
+
+```xml
+<!-- WorkManager contributes these; the daily job is unconstrained and need not
+     survive a reboot, so none is used. Re-check the APK if that changes. -->
+<uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" tools:node="remove" />
+```
+
+- **Put the check in the release gate, not in a reviewer's head.** Fail the build
+  on any permission outside an allowlist, alongside the existing no-`INTERNET`
+  and signature checks.
+- **A removal is a claim that the feature does not need it.** If a worker later
+  gains a network constraint or a foreground service, `tools:node="remove"` turns
+  it into a silent runtime failure, so delete the line rather than working around
+  it, and re-dump the APK.
+- **This matters most where a privacy claim is part of the product.** An unused
+  permission is a store-review and trust finding whatever the reason for it, and
+  "a library added it" is not a defence a user can see.
+
+## Verify R8 statically, not by launching the app
+
+Launching a release build tells you nothing about a code path you did not exercise, and the
+failure mode here is a feature that silently no-ops. Two static probes; the second is the one
+that always answers.
+
+**Probe 1 — the mapping file.** Cheap when it says anything:
+
+```bash
+grep -E '^com\.example\.data\.(MyModel|MyEnum)' app/build/outputs/mapping/release/mapping.txt
+grep -E '^\s+com\.example\.data\.MyEnum ' app/build/outputs/mapping/release/mapping.txt
+```
+
+A name mapped to itself (`Wiegand -> Wiegand`) is kept; mapped to a short token (`-> i`) is not.
+
+**But absence of a line proves nothing.** In Isai's 42 MB mapping, both enums appear as a bare
+class line with **no member lines at all**:
+
+```
+fm.isai.radio.data.StationCategory -> h3.F:
+fm.isai.radio.data.RecordingQuality -> h3.D:
+```
+
+Nothing indented follows either. Read literally that looks like "everything was stripped"; the
+constants were in fact all present in the DEX. A silent-empty grep is the worst possible answer
+to a silent-failure question, so don't stop here.
+
+**Probe 2 — count the name strings in the DEX.** `Enum.name` comes from the string literal passed
+to the `java.lang.Enum` constructor, so a surviving name is a string in the DEX:
+
+```python
+import json, zipfile
+out = 'app/build/outputs/apk/release/'
+z = zipfile.ZipFile(out + json.load(open(out + 'output-metadata.json'))['elements'][0]['outputFile'])
+dex = b''.join(z.read(n) for n in z.namelist() if n.endswith('.dex'))
+print(dex.count(b'Talk'))     # 1 -> the constant name survived
+```
+
+Choose a constant whose name differs from **every** other literal on it, or the count is
+ambiguous: `Music("Music")` proves nothing because the label supplies that string anyway.
+`Talk("Stories & talk")` is the discriminator — `Talk` can only be the enum's name. Design one
+such constant into the check rather than guessing which occurrence is which.
+
+Do all of this whenever `isMinifyEnabled` is turned on, and again after adding anything
+reflective.
+
+## Always ship a signed release APK (user rule, Nov-09-2026)
+
+The deliverable of every Android build Claude hands over is a **signed release APK**
+(`assembleRelease`), never a debug APK and never an unsigned release. Debug builds are for the
+local edit-install loop only.
+
+If the repo has no release key yet, create one in the same change, following the convention
+already used across the `D:\GitHub` Android repos:
+
+```powershell
+# From the repo root. keytool ships with the JDK (Android Studio's jbr\bin).
+keytool -genkeypair -v -keystore release.jks -alias release -keyalg RSA -keysize 2048 -validity 10000 `
+  -dname "CN=<App Name>, O=Pandiyaraj Karuppasamy"
+```
+
+- Write `keystore.properties` (`storeFile=release.jks`, `storePassword`, `keyAlias=release`,
+  `keyPassword`) and gitignore **both** files before the first commit. Generate a random password;
+  never print it or put it in a commit, PR or chat.
+- Back up both outside the repo straight away, to `%USERPROFILE%\keystores\<repo>-release.jks`
+  and `<repo>-keystore.properties` (the folder this machine already uses). Losing the key means
+  no installed copy can ever be updated (see below).
+- Wire the `signingConfig` as in the next section, then prove it: `apksigner verify --print-certs`
+  on the built APK must print the release certificate, not `CN=Android Debug`.
+
+## Signing lives in a gitignored properties file
+
+Release with no `signingConfig` produces an **unsigned APK that cannot be installed** — easy to
+miss, because the build succeeds.
+
+```kotlin
+val keystoreProps = Properties().apply {
+    val f = rootProject.file("keystore.properties")
+    if (f.exists()) f.inputStream().use { load(it) }
+}
+val hasSigning = keystoreProps.getProperty("storeFile") != null &&
+    rootProject.file(keystoreProps.getProperty("storeFile")).exists()
+```
+
+Guard the whole config on `hasSigning` so a clone without the keystore still *configures* —
+failing the configuration phase on a missing local file blocks every task, including `assembleDebug`
+and the tests.
+
+**Import `Properties`; do not fully-qualify it.** Inside the `android { }` DSL there is a value
+named `java` in scope, and in Kotlin a value shadows a root package of the same name — so the
+fully-qualified form fails to resolve, with an error that blames `util`:
+
+```
+e: build.gradle.kts:26:34: Unresolved reference: util
+e: build.gradle.kts:28:51: Unresolved reference: load
+      val keystoreProps = java.util.Properties().apply {
+                               ^ Unresolved reference: util
+```
+
+Nothing in that names the cause, and `java.util.Properties` is obviously a real class, so the
+instinct is to doubt the JDK or the Gradle version. Put `import java.util.Properties` at the top
+of the build script and write `Properties()` — which is what the snippet above does, and the
+reason it does.
+
+- Gitignore both the keystore and the properties file, then confirm against the **remote**, not
+  the working tree: `git ls-tree -r --name-only origin/main | grep -iE '\.jks$|keystore'`.
+- **Back the keystore up outside the repo.** Losing it means no future build can update an
+  installed copy: Android refuses an update signed with a different key, so every device needs an
+  uninstall — taking its saved data with it.
+- Debug and release use different keys, so swapping one for the other on a device requires an
+  uninstall first. Expect `INSTALL_FAILED_UPDATE_INCOMPATIBLE` and handle it in the deploy
+  script rather than rediscovering it each time — though a vendor restriction can surface a
+  *different* error at the same step (Isai got `INSTALL_FAILED_USER_RESTRICTED` on MIUI, which
+  reads like the release APK is at fault rather than the freshness of the install).
+- **Capture the app's saved data before that uninstall.** It is the last moment you can: the
+  installed build is still debug, so `run-as` works, and the release build that replaces it is
+  not debuggable, so there is no way back in afterwards. The
+  [deploy skill](../../skills/android-deploy/SKILL.md) has the command. Read-only, a few
+  seconds, and it turns "your settings are gone" into a list you can hand back.
+
+## Name the APK `<appname>_<versionName>.apk`
+
+AGP names every APK after the module: `app-release.apk`, in every repo, at every version. Once
+that file is installed, posted to Telegram or handed to someone, nothing about it says which app
+or which build it is. Name it in the build instead (user rule, global CLAUDE.md): release
+`<appname>_<versionName>.apk`, debug `<appname>_<versionName>-debug.apk`, where the app name is
+the Gradle `rootProject.name` and the version is the build's `versionName` (`usbdisplay_0.1.1.apk`,
+`learnenglish_0.1.0.apk`). That is the same name the copy in `D:\GitHub\apk` gets. Set it in the
+app module's `build.gradle.kts` when creating or touching any Android app:
+
+```kotlin
+androidComponents {
+    onVariants { variant ->
+        val appName = rootProject.name
+        variant.outputs.forEach { output ->
+            (output as? com.android.build.api.variant.impl.VariantOutputImpl)
+                ?.outputFileName
+                ?.set(output.versionName.map { v ->
+                    if (variant.buildType == "release") "${appName}_$v.apk"
+                    else "${appName}_$v-${variant.buildType}.apk"
+                })
+        }
+    }
+}
+```
+
+Verified on `usbdisplay` (AGP 8.7.2): `assembleRelease` wrote `usbdisplay_0.1.1.apk`, signed, and
+`output-metadata.json` recorded the new name in `elements[].outputFile`; `assembleDebug` wrote
+`usbdisplay_0.1.1-debug.apk`.
+
+- **Read the file name from `output-metadata.json`**; never hard-code `app-release.apk` in a script,
+  task, VS Code task or README. The collect-release-apk init script already reads it, which is why
+  it follows the rename with no change. A hard-coded path does not fail loudly: a stale
+  `app-release.apk` left in `build/outputs` gets installed or scanned instead of the build you just
+  made. Update any install command or README line that still names `app-release.apk`.
+- `VariantOutputImpl` is AGP's implementation class; the public `VariantOutput` has no
+  `outputFileName`. The cast is the usual way to rename, but it is internal API: if an AGP upgrade
+  breaks it, the build fails to compile, which is the safe way for it to fail.
+- `${appName}_$v` needs the braces: `$appName_$v` would read a variable called `appName_`.
+- Repos that still name APKs after the applicationId, or with the short-lived hyphen form
+  (`<repo-folder>-<versionName>.apk`, Nov-09 to Nov-15-2026), move to this name the next time they
+  are released.
+
+## A lint failure can be a toolchain mismatch, not a finding
+
+`lintVitalAnalyzeRelease` gates `assembleRelease`, and it fails on a JDK it does not support
+with a bare version string and no findings — e.g. `> 25.0.2` on AGP 8.7.2 running under the
+JDK 25 that current Android Studio bundles as its JBR.
+
+Recognise it by the shape: no lint report, no rule name, just a number. Build on the JDK the
+AGP supports, or upgrade AGP. If the bare number appears at configuration time instead, the
+failing compiler is Gradle's own, and `org.gradle.java.home` fixes it; see
+[ci-cost](ci-cost.mdc) ("AGP and the JDK"). Disabling the gate is a stopgap: record *why* next to it, or the
+next reader assumes the project has lint findings it is hiding:
+
+```kotlin
+lint {
+    // AGP 8.7.2's lint cannot run on JDK 25; lintVitalAnalyzeRelease dies with a bare
+    // "25.0.2". A toolchain incompatibility, not a finding. Re-enable on newer AGP or JDK 17.
+    checkReleaseBuilds = false
+}
+```
+
+## `gradlew` must be committed executable, with LF endings
+
+On Windows, `git init` sets `core.filemode=false`, so a plain `git add` records
+`gradlew` as mode `100644`. Everything works locally and the repo is broken for
+every Linux or macOS checkout and for CI. Verified Oct-19-2026 under WSL, same
+file, three states:
+
+| Committed as | Result |
+|---|---|
+| mode 644 | exit 126, `Permission denied` |
+| mode 755, LF | runs |
+| mode 755, CRLF | exit 127, `cannot execute: required file not found` |
+
+The last row is the misleading one: the file exists, the error names the
+interpreter line (`bash\r`) as missing. Fix both, then check:
+
+```
+git update-index --chmod=+x android/gradlew
+git ls-files -s android/gradlew          # must start with 100755
+```
+
+Pin the endings in `.gitattributes` (the hub template already has
+`gradlew text eol=lf`). The attribute fixes line endings only; it does not fix
+the mode, so the `update-index` step is still needed.

@@ -1,0 +1,43 @@
+---
+description: New repository defaults - every GitHub repo is created PRIVATE and its default branch is `main` (never `master`). Covers `gh repo create`, hubctl/repo-init scaffolds, `git init`, renaming a scaffold's `master`, and checking visibility and default branch after the first push. Request when creating, scaffolding, initialising, publishing or pushing a new repository.
+alwaysApply: true
+---
+
+# New repository defaults (core)
+
+Author: Pandiyaraj Karuppasamy
+Date: Nov-14-2026
+
+Owner rule (Nov-14-2026): **always prefer a private repo and the `main` branch.**
+
+## Private by default
+
+- Create every GitHub repository as **private**: `gh repo create <owner>/<name> --private`.
+  Never pass `--public`, and never omit the flag (an interactive default can pick public).
+- Make a repo public only when the owner asks for it in so many words for that repo
+  (for example a PyPI package page or a GitHub Pages site). Even then, prefer publishing a
+  slice (see the `publish-course-static-site` skill) over flipping the source repo.
+- A public repo cannot be made fully private again: forks, clones and caches survive the
+  switch. Treat going public as irreversible and confirm first.
+
+## `main`, never `master`
+
+- `git init -b main` (git 2.28+). The global config carries `init.defaultBranch=main`, but
+  pass `-b main` anyway so a machine without that config still gets it right.
+- `hubctl init` uses `git init -b main`. A scaffold that still comes out on `master` gets
+  `git branch -m master main` **before** the first push, so the remote never has `master`.
+- `gh repo create --source . --push` takes the current local branch as the default branch,
+  so rename first, push second.
+
+## Check after the first push
+
+```bash
+gh repo view <owner>/<name> --json visibility,defaultBranchRef \
+  --jq '.visibility + " " + .defaultBranchRef.name'     # expect: PRIVATE main
+```
+
+If either is wrong: `gh repo edit <owner>/<name> --visibility private --accept-visibility-change-consequences`,
+and `gh repo edit <owner>/<name> --default-branch main` after pushing `main`, then delete the
+remote `master`.
+
+Use the **`github-repo-create`** skill for the full sequence.

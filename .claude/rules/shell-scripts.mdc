@@ -1,0 +1,78 @@
+---
+description: Bash scripts under `set -euo pipefail` : a pipeline that legitimately fails (grep with no match, getent for a missing group, a reader that closes early) ends the script with a non-zero exit and no message, including inside $(...), and `grep -q` at the end of a pipe can fail a script that is correct. Tolerate the expected failure on that pipeline, do not drop pipefail, and read the whole listing before testing it.
+globs: **/*.sh, **/*.bash
+alwaysApply: false
+---
+
+<!--
+Author: Pandiyaraj Karuppasamy
+Date: Nov-14-2026
+-->
+
+# Shell scripts (core)
+
+Scripts here start with `set -euo pipefail`. That is right, and it has two traps that look like
+a script that "did nothing". Both were hit in `gitea-server` (Nov-13 and Nov-14-2026).
+
+## A pipeline whose first command may fail aborts the script, silently
+
+Under `pipefail` a pipeline fails when any command in it fails, and `set -e` then ends the script
+even when the pipeline sits inside `$(...)` in an assignment. No message is printed unless the
+script prints one.
+
+```console
+$ bash -c 'set -euo pipefail; x="$(grep nomatch /dev/null | cut -d: -f3)"; echo reached'
+$ echo $?
+1                                   # no output at all
+$ bash -c 'set -eu;           x="$(grep nomatch /dev/null | cut -d: -f3)"; echo reached'
+reached
+$ bash -c 'set -euo pipefail; x="$(grep nomatch /dev/null | cut -d: -f3 || true)"; echo reached'
+reached
+```
+
+Verified on Nov-14-2026. The real case: `have="$(getent group gitea-ops | cut -d: -f3)"` in
+`install.sh`. `getent` exits 2 for a group that does not exist yet, which is the normal first run, so
+the installer ended with exit 2 and an empty log on the first server it ever ran on. The tests
+had passed: the fake `getent` always found the group.
+
+- **Add `|| true` to the pipeline that is allowed to find nothing**, and test the empty result
+  (`[[ -z "$have" ]]`) on the next line. Name the reason in a comment: "getent exits 2 when the
+  group is missing".
+- **Do not turn `pipefail` off to get past it.** It is what catches `curl ... | tee` hiding a
+  failed download.
+- **A command that is allowed to fail gets its own test in the suite**: run the script on a
+  machine where the thing it looks for does not exist.
+- **A silent exit is a finding.** When a script ends with a non-zero status and no output, run it
+  once with `bash -x` and read the last lines before changing anything.
+
+## `grep -q` at the end of a pipe can fail a correct script
+
+`grep -q` exits at the first match and closes the pipe; the writer then gets SIGPIPE, and under
+`pipefail` the pipeline reports that failure even though the answer was "yes".
+
+```bash
+# flaky under pipefail: tar is killed by SIGPIPE when grep finds its match early
+tar -tf "$archive" | grep -qx -- "$name"
+
+# stable: read the whole listing, then test it
+list="$(tar -tf "$archive")"
+grep -qx -- "$name" <<<"$list"
+```
+
+This made `tests/test-backup.sh` pass locally and fail intermittently in CI (Nov-13-2026): the
+same archive, the same command, a different result depending on timing. The fix is above; the
+cost was a red merge.
+
+- **Capture the output first, then match it.** For big output use `grep -c` or `awk` (they read to
+  the end) instead of `grep -q`.
+- **A flaky shell test is this until shown otherwise** when a pipe ends in `grep -q`, `head -n1`
+  or `read` and `pipefail` is on.
+
+## Checklist
+
+1. `set -euo pipefail` on line 2 or 3 of every script (after the shebang and header comment).
+2. Every `$(a | b)` where `a` may legitimately produce no match or a non-zero status carries
+   `|| true`, with a comment.
+3. No `grep -q` (or `head -n1`) at the end of a pipe: capture first.
+4. The suite includes one run where the optional thing is absent.
+5. `shellcheck -x` clean.
