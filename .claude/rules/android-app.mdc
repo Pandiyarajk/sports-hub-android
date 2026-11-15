@@ -1,0 +1,848 @@
+---
+description: Android/Kotlin app standards: Compose recomposition and stable parameters, the Row that starves its last child until Text wraps per character, two weights in one Row that split the line instead of pushing the trailing item to the edge, DataStore write amplification, kotlinx.serialization dropping defaults out of request bodies, LAN socket clients (UDP discovery, one-shot TCP), the ACCESS_LOCAL_NETWORK runtime permission whose denial looks like a dead server, why a pure-Java desktop library can deadlock on Conscrypt and fail differently in debug and release, serving TLS from the phone (the AndroidKeyStore key authorisations Conscrypt needs, and TLS 1.3 breaking small protected uploads),what android:usesCleartextTraffic does not cover, pinning a LAN device's self-signed certificate, sp inside a fixed dp container, the edge-to-edge window at targetSdk 35 and why a screen rooted in Surface draws under the status bar while a Scaffold does not, back navigation for state-driven Compose screens and the predictive-back anti-pattern, why an asset-hosted WebView does not need INTERNET, and why a library's newest release can need a newer Kotlin or compileSdk than yours (MapLibre 13, SQLCipher 4.18), Robolectric at SDK 35 needing JDK 21 (pin sdk=34), and bundling the variable Noto Devanagari/Tamil fonts with per-script spans, a lone Devanagari combining mark drawing a dotted circle, and Compose layout-test pitfalls (overlap rectangles, Robolectric text height, scrolling before a click). Request when writing an Android app, a Compose screen or a row of chips, a DataStore-backed setting, a JSON request body, any device client, anything reaching the local network, any third-party JVM library, or anything that handles the back gesture.
+globs: **/*.kt, **/*.kts, **/AndroidManifest.xml, **/proguard-rules.pro
+alwaysApply: false
+---
+
+<!-- Modified: Nov-15-2026 (string resource pitfalls and piped Gradle output, from Helm) -->
+
+# Android app (Kotlin / Compose)
+
+For native Android apps. The rules below are the ones that cost real time and produce **no
+error**: a UI that renders correctly but at 25 fps, a setting that saves and never reads back,
+a discovery socket that finds nothing while reporting success.
+
+**Plan the UI with an agent first** (user rule, Nov-09-2026): before writing the screens of a new
+app, or a new screen in an existing one, run the [ui-plan](../../skills/ui-plan/SKILL.md) skill.
+A planning agent returns the screen map, wireframes and every state (permission refused, no
+device, empty, error), saved as `docs/UI-PLAN.md`.
+
+For the release build (signing, R8, the obfuscation that silently breaks persistence, a
+persisted key redeclared in two modules, and the permissions a library merges into your
+manifest that only the APK shows), see [release-build](release-build.mdc). For keeping CI cheap, and the JDK version AGP needs, see
+[ci-cost](ci-cost.mdc). For periodic background work - and why the system rations the interval
+you asked for - see [background-work](background-work.mdc). For getting a build onto a phone
+and proving it works, see the
+[android-deploy](../../skills/android-deploy/SKILL.md) skill. For why
+`connectedAndroidTest` reports success when it runs zero tests, see
+[instrumented-test-discovery](instrumented-test-discovery.mdc). For an app that records Wi-Fi, Bluetooth
+or cell scan results with a location, see the [android-radio-survey](../../skills/android-radio-survey/SKILL.md) skill.
+
+## Compose: a parameter that changes every tick defeats skipping
+
+Compose skips a composable when its parameters compare equal. Pass a data class that contains
+a timestamp — or anything else that moves on its own — and equality fails on every update, so
+**every** instance recomposes even when nothing on screen changed.
+
+The trap is that the object looks stable: it is a `data class`, all its fields are `val`, and
+the field doing the damage is never displayed.
+
+```kotlin
+// Wrong. Device holds its last announce, whose receivedAt changes on every packet, so all ~25
+// visible rows recompose whenever any one device is heard from.
+@Composable fun DeviceRow(device: Device, onClick: () -> Unit)
+
+// Right. Only the values actually drawn, all stable, so an unchanged row is skipped.
+@Composable fun DeviceRow(
+    title: String, ip: String, presence: Presence, favourite: Boolean, onClick: () -> Unit
+)
+```
+
+Measured on a 25-device list, changing only this: **317 → 129 frames** per 60 s idle, and slow
+UI-thread frames **49 → 16**.
+
+Related, same root cause:
+
+- **Emitting a fresh wrapper defeats `StateFlow`'s own dedupe.** `StateFlow` drops an identical
+  value, but `Load.Ok(newList)` is a new object every time, so the whole screen recomposes on a
+  tick where nothing changed. Compare before emitting: `if (new == current) return`.
+- **Filter and derive inside `remember`**, keyed on the inputs. `entries.filter { … }` in a
+  composable body walks the whole list on every recomposition, on the UI thread.
+- **One infinite animation per list row is not free.** `rememberInfiniteTransition` inside a row
+  keeps that row recomposing at frame rate forever; with a screenful of rows it dominates the
+  frame budget. Prefer a static indication, or hoist one animation above the list.
+
+Drive periodic UI updates from **one** timer and let nothing else push to a `StateFlow`. That
+interval then *is* the app's refresh rate, which makes it reviewable.
+
+## Compose: a `Row` starves its last child, and `Text` then wraps per character
+
+`Row` hands out width in order. Give it several children that size themselves from their
+content and the last one can be left with almost none — and `Text`, asked to render in a
+space narrower than one word, does not overflow or clip by default. It wraps. One character
+per line.
+
+Observed with three badge pills on a phone: two fitted, and the third rendered as a ~500px
+tall column reading `2 / n / e / w / d / o / c / u / m / e / n / t / s`. No exception, no
+warning, no lint — `Row` measured its children perfectly happily and the third was simply
+given a width it could not use. It is the layout sibling of the recomposition traps above:
+the code looks right and the screen is wrong.
+
+```kotlin
+// Wrong. Three content-sized chips do not fit across a phone, and the third gets ~0dp.
+Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+    Pill("2 new homework"); Pill("2 new notices"); Pill("2 new documents")
+}
+
+// Right. Wraps to a second line instead of compressing, and the label can never
+// degrade into a column of letters even if something else squeezes it.
+FlowRow(
+    horizontalArrangement = Arrangement.spacedBy(8.dp),
+    verticalArrangement = Arrangement.spacedBy(8.dp),
+) { … }
+
+Text(text = label, maxLines = 1, softWrap = false)
+```
+
+- **Variable-width chips, tags, pills or badges go in a `FlowRow`**, not a `Row`.
+- **A label that is conceptually one line says so** — `maxLines = 1` and `softWrap = false`.
+  Cheap, and it turns a silent mis-render into a visible truncation.
+- A plain `Row` is still right when every child has a bounded width, or exactly one child
+  takes `Modifier.weight(1f)` and the rest are icons. The failure needs *two or more*
+  children wanting to size themselves from content.
+- The mild version is easy to miss in review: a title next to a logo that quietly becomes
+  two lines. Same cause, so treat any content-sized `Row` as suspect at narrow widths.
+
+### Two weights in one `Row` split the line, they do not push
+
+"Exactly one child takes `weight(1f)`" above is load-bearing. The common push-right idiom
+breaks it without looking like it does: a label with `weight(1f, fill = false)` (so it does
+not stretch), then `Spacer(Modifier.weight(1f))`, then a trailing time or count. Two weights
+of 1 share the free width **in half**. The label may use less than its half, but the unused
+part does not pass to the spacer, so the trailing item stops short of the edge; and when the
+label needs more than half (beside a pill, say), it is cut.
+
+Observed Oct-30-2026 in `flash-sms`, an outbox list on a Nothing A009P (screenshot 922 px
+wide): the time ended at 710 px while the status icon under it ended at 777 px, and a number
+beside a status pill rendered as `95...`. No warning, and every tile looked plausible alone;
+it only showed as a ragged right edge down the list.
+
+```kotlin
+// Wrong. Two weights: the label's half and the Spacer's half, the time floats mid-line.
+Row {
+    Text(number, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false))
+    Icon(Icons.Filled.Bolt, null)
+    Spacer(Modifier.weight(1f))
+    Text(time)
+}
+
+// Right. One weighted slot holds everything on the left; the time sits at the true edge.
+Row {
+    Row(Modifier.weight(1f)) {
+        Text(number, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false))
+        Icon(Icons.Filled.Bolt, null)
+    }
+    Spacer(Modifier.width(8.dp))
+    Text(time)
+}
+```
+
+After the fix, all three tiles' times ended at the same x (775 px). Two related rules that
+fell out of the same list:
+
+- **Give every row the same trailing slot.** A Cancel button on some rows and not others
+  shifts those rows' right-aligned text; one icon button of fixed size on every row (X on a
+  cancellable row, a bin on the rest) keeps the column straight.
+- **Check alignment across rows, not one row at a time.** The bug is invisible in a single
+  item preview; render three or more and compare right edges.
+
+Related, and the same shape of silent mis-render: **`sp` inside a fixed `dp` container clips
+once the user raises their font scale.** `fontSize` in `sp` scales with the accessibility font
+setting; `Modifier.size(dp)` does not. A glyph centred in a fixed circle fits perfectly at 100%
+and overflows it at 130%, on a device you were never holding.
+
+```kotlin
+// Wrong: the badge is fixed, the glyph is not.
+Box(Modifier.size(52.dp).clip(CircleShape)) { Text(emoji, fontSize = 26.sp) }
+
+// Right for an icon-like glyph: density-scaled, not font-scaled.
+val glyph = with(LocalDensity.current) { 26.dp.toSp() }
+```
+
+Use this only where the text *is* iconography — an emoji badge, a monogram avatar. Real text must
+keep honouring the user's font size; the fix there is to let the container grow instead.
+
+## The window is edge-to-edge, and `Surface` has no inset contract
+
+At `targetSdk 35` the app is handed the **whole** window, status bar and navigation bar
+included. Insetting content becomes the app's job, and nothing warns you: the layout is
+correct, it is simply drawn underneath the clock, the battery indicator and the gesture bar.
+Tap targets in that strip are swallowed by the system bar.
+
+`Scaffold` handles this for you. `Surface` does not, and the difference is visible in their
+signatures:
+
+```kotlin
+// Scaffold owns an inset contract - this named argument resolves.
+Scaffold(contentWindowInsets = WindowInsets.safeDrawing) { padding -> ... }
+
+// Surface takes no inset parameter of any kind. A screen rooted here is edge-to-edge
+// whether or not that was the intention.
+Surface(modifier = Modifier.fillMaxSize()) { ... }
+```
+
+Verified by compiling both against `composeBom 2024.10.01`: the `Scaffold` call builds, and
+`Surface` has no equivalent parameter to pass.
+
+**This is why it bites so rarely and then so completely.** Every screen built on `Scaffold`
+is insetted by accident of that choice, so a codebase can be entirely correct without anyone
+having thought about insets. The one screen someone roots in a bare `Surface`, `Box` or
+`Column` is broken from the first frame. Across eight Android repos here, seven used
+`Scaffold` throughout and never saw the problem; the eighth used `Surface` for a full-bleed
+dashboard and drew its title row under the status bar on the first device it ran on.
+
+- **Apply the insets once, at the theme, not per screen.** A screen added later cannot then
+  forget. One `Box` wrapping the theme's content, with
+  `windowInsetsPadding(WindowInsets.safeDrawing)`, covers every screen including ones that
+  do not exist yet.
+- **Paint the inset area the same colour as the content**, or the bars show as a seam in a
+  different shade. The wrapper needs its own `background(...)`, because the padding pushes
+  content in without colouring what it vacated.
+- **`safeDrawing`, not `systemBars`.** It also covers a punch-hole camera cutout and any
+  rounded-corner inset the platform reports. `systemBars` leaves content under a cutout.
+- **Set the bar icon colours.** On a dark background the platform default of dark icons
+  renders the clock and battery nearly invisible:
+  `WindowCompat.getInsetsController(window, window.decorView).isAppearanceLightStatusBars = false`
+  (and `isAppearanceLightNavigationBars`).
+- **Call `enableEdgeToEdge()` anyway.** The behaviour is on regardless at targetSdk 35, so
+  the call changes nothing functionally - it makes the window contract visible in the source
+  instead of implied by a number in `build.gradle.kts`, and it is where the icon colours go.
+
+**There is an opt-out, and it is a trap.** `windowOptOutEdgeToEdgeEnforcement` exists as a
+theme attribute - verified present in `android-35/data/res/values/attrs.xml` - and Google
+documents it as deprecated on arrival, with the enforcement becoming unconditional in a
+later SDK (reported as 36; not verified here, android-36 was not installed on the machine
+this was written on, so confirm before relying on the exact version). Either way it defers
+the same work rather than removing it, and a deferral that expires on someone else's
+schedule is worse than an afternoon now. Handle the insets.
+
+**A screenshot from a real device is the only check that counts for layout.** For "does it launch,
+is the text readable, does the first permission prompt work", an emulator is enough and is always
+available (see the android-deploy skill). The emulator's default
+skin has a shallower status bar than most phones and no cutout, so a layout that overlaps by
+a few dp on hardware can look correct there. This was reported by a user photographing their
+own screen, not by any test.
+
+## Compose: `Text` outside a `Surface` is black, on a dark theme too
+
+`MaterialTheme` supplies colours but not a content colour; `Surface` and `Scaffold` set
+`LocalContentColor`, a bare `Box` does not. A theme wrapper that is a `Box` with a dark
+`background` therefore leaves every `Text` that is not inside a `Surface` at the default black:
+unreadable, with no error and no failing test. Reported on `gitea-admin-android` 0.1.0 on
+Nov-14-2026 ("black color text on dark theme"); the first screenshot after the fix showed light text.
+
+- **Provide the colour in the theme wrapper:**
+  `CompositionLocalProvider(LocalContentColor provides colorScheme.onBackground) { content() }`.
+- **Map the Material 3 container roles too** (`surfaceContainer*`, `secondaryContainer`,
+  `onSecondaryContainer`, `inverseSurface`): an unset role keeps the baseline purple-grey value,
+  which shows up in dialogs, chips and the navigation bar.
+- **Look at one screenshot per theme** before posting an APK; no JVM test sees this.
+- **Seen twice, in two apps:** learn-hindi 0.3.0 (Nov-14-2026) drew the profile picker's title and
+  names black on near-black; the fixed build draws them in the theme's text colour. Set the
+  default in the theme wrapper and again in any container that paints its own `background(...)`.
+
+## Compose: a screen reached by a state flip is not a back-stack entry
+
+The companion to the section above: there, the app owned more of the window than it realised;
+here, it owns less of the navigation. Both are cases where the app's own idea of a "screen"
+and the system's do not line up, and both fail silently.
+
+A composable that swaps what it renders based on its own state is a *screen* to the user and
+nothing at all to the back stack. Back therefore falls through to the Activity's default
+handling — which finishes it — so back from the second screen **exits the app** instead of
+returning to the first.
+
+```kotlin
+// Two screens to the user. One entry to the system.
+var openChapter by remember { mutableStateOf<Chapter?>(null) }
+val chapter = openChapter
+if (chapter != null) {
+    BackHandler { openChapter = null }        // ← without this, back leaves the app
+    DetailScreen(chapter, onBack = { openChapter = null })
+    return
+}
+ListScreen(onOpen = { openChapter = it })
+```
+
+Observed on a two-screen Compose app: the detail screen had an `onBack` lambda already, wired to
+the top bar's arrow icon, so back worked when *tapped* and killed the app when *gestured*.
+`grep -rn BackHandler` over the whole module returned nothing, which is the fastest tell.
+
+- **Any state-driven screen needs its own `BackHandler`.** If you are not using a navigation
+  library, the back stack knows only about your Activities — every screen boundary you invented
+  is invisible to it.
+- **An `onBack` parameter is not back handling.** It is a callback; something has to call it.
+- **The symptom names the wrong screen.** This was reported as "back from the lesson minimizes the
+  app", and the lesson was a *different Activity* one level down that behaved correctly. Two
+  fixes were aimed at that Activity before anyone checked which screen was actually showing.
+  Establish that first.
+
+## Do not disable a callback and re-dispatch back
+
+`OnBackPressedCallback` with `isEnabled = false` followed by `onBackPressedDispatcher.onBackPressed()`
+is an anti-pattern AndroidX documents as incompatible with predictive back — which is on by
+default for apps targeting API 35. Register the callback with `isEnabled` reflecting whether you
+can actually handle back, and let the system default do the rest.
+
+A `WebView` host is the usual place this appears, and `webView.canGoBack()` is usually the wrong
+question to ask:
+
+```kotlin
+// Wrong on two counts for a page that routes by location.hash.
+if (webView.canGoBack()) webView.goBack()
+else { isEnabled = false; onBackPressedDispatcher.onBackPressed() }
+```
+
+A hash change **is** a history entry, so `canGoBack()` goes true as soon as the page navigates
+itself — and `goBack()` then walks hash history inside the already-loaded document, which changes
+nothing on screen if the page reads its hash only at startup. Back appears to do nothing,
+repeatedly, until the history runs out and the broken fallback fires.
+
+If one screen means one Activity, do not intercept back at all: the system default finishes it and
+predictive back animates the transition for free.
+
+**Verifying any of this needs a real finger** — `adb shell input keyevent KEYCODE_BACK` bypasses
+the predictive-back path entirely. See
+[android-deploy](../../skills/android-deploy/SKILL.md#synthetic-back-cannot-exercise-predictive-back).
+
+## DataStore: never write on every keystroke
+
+A `TextField` whose `onValueChange` calls a `suspend` save performs one disk write **per
+character**, and each write re-emits the backing `Flow`, which recomposes every collector. On a
+list screen that means a full rebuild mid-word.
+
+Hold the text in local state and commit once it settles:
+
+```kotlin
+var name by remember(id) { mutableStateOf(saved.orEmpty()) }
+LaunchedEffect(id, name) {
+    if (name != saved.orEmpty()) { delay(500); repo.setName(id, name) }
+}
+```
+
+The same applies to any high-frequency event — don't persist per network packet or per sensor
+sample. Persist only what a user asked to keep, and only when a value actually changed.
+
+## LAN socket clients
+
+For discovering and driving devices on the local network. These are the failure modes that
+report success.
+
+**None of it works without the runtime permission below** — see
+[Local network access is a runtime permission](#local-network-access-is-a-runtime-permission-and-denial-looks-like-server-is-down).
+Get that wrong and every rule in this section is correct and the app still finds nothing.
+
+- **Set `reuseAddress` before binding, and bind explicitly.** Without it, anything already
+  holding the port makes the bind throw. Swallow that exception — as a `catch` around a
+  discovery loop usually does — and the app simply never receives a packet, with nothing on
+  screen to say so.
+  ```kotlin
+  DatagramSocket(null).apply {
+      reuseAddress = true          // or a stale bind silently kills discovery
+      broadcast = true
+      soTimeout = 1_000            // or cancellation cannot interrupt receive()
+      bind(InetSocketAddress(PORT))
+  }
+  ```
+- **Set `soTimeout`.** A blocking `receive()` with no timeout cannot be interrupted by coroutine
+  cancellation, so the socket outlives the scope that owns it.
+- **Decode `packet.length` bytes.** Not "up to the first NUL" — that only works because the
+  buffer happened to be zero-filled, and it throws on a datagram that fills the buffer.
+- **Read the sender as `packet.address.hostAddress`.** `InetAddress.toString()` is
+  `host/1.2.3.4` once a name resolves, so string-trimming it yields garbage intermittently —
+  which is worse than always.
+- **One long-lived socket in one coroutine**, not a timer that opens and closes one per tick.
+- **Never filter on the sender's source port.** A device that broadcasts without binding sends
+  from an ephemeral port that changes.
+- **Key devices on a stable identity** — MAC, serial — and compare it with equality, not
+  `contains`. Substring-matching an address makes `192.168.1.2` match `192.168.1.20`.
+- **Age devices out; do not delete them.** A device that stopped announcing is usually the one
+  being looked for. Sort by something stable (address) rather than by liveness, or rows move
+  under the user's finger as state changes.
+
+## Local network access is a runtime permission, and denial looks like "server is down"
+
+Everything in the section above depends on a permission that did not used to exist. Android
+is gating local network access behind a runtime permission:
+
+| Version | Status | Permission |
+|---|---|---|
+| Android 16 | opt-in — only apps that opt in are affected | `NEARBY_WIFI_DEVICES` |
+| **Android 17+** | **mandatory** for apps targeting 17+ | `ACCESS_LOCAL_NETWORK` |
+
+Play's target-API window makes targeting 17 a matter of when, not whether.
+
+**It is not a discovery-only concern.** Google's documentation states the restrictions are
+"implemented deep in the networking stack, and thus they apply to **all networking APIs**…
+including sockets created in the platform or managed code, networking libraries like Cronet
+and OkHttp, and any APIs implemented on top of those." So it gates the plain HTTPS call to a
+device just as much as the UDP announce socket — and it gates a third-party library's sockets
+too, including a JDBC driver's, which is not obvious from the library's own docs.
+
+| Operation | Needs the permission |
+|---|---|
+| Outgoing TCP connect / accepting TCP | yes |
+| Sending or receiving UDP unicast, multicast, broadcast | yes |
+| Resolving a `.local` service name | yes |
+| DNS to a local server on port 53 | no |
+
+**The failure mode is the reason this belongs in this rule.** Denial does not raise a
+permission error where the call is made:
+
+- **TCP → a timeout.** Identical to a host being off, a wrong port, a firewall, or not being
+  on the VPN.
+- **UDP → `EPERM`.** Which the advice above — one `catch` around a discovery loop — swallows
+  completely, leaving an app that reports success and never receives a packet.
+
+So the *exact* symptom this rule warns about elsewhere is now reachable through a cause no
+amount of socket correctness can fix.
+
+- **Check the permission before any local network access**, and request it explicitly rather
+  than inferring failure from a timeout.
+- **Keep `PERMISSION_DENIED` a distinct state from `UNREACHABLE`.** Collapsing both into
+  "offline" makes every "it can't find my device" report unfalsifiable — the one question you
+  most need answered is the one the UI has thrown away.
+- On NDK paths, `android_getnetworkblockedreason(int sockFd)` distinguishes a blocked socket
+  from an ordinary timeout.
+- **Re-verify the permission name and timeline when you implement.** This area is actively
+  changing; the opt-in/mandatory split above is the state as of Aug-2026.
+
+## kotlinx.serialization drops defaults, and the server reads that as "no filter"
+
+`Json` omits any property still holding its default value. A request class whose fields
+**all** have defaults therefore serializes to `{}` — a valid, empty, entirely wrong body.
+
+```kotlin
+@Serializable data class Pagination(
+    @SerialName("PageNumber") val pageNumber: Int = 1,
+    @SerialName("PageSize") val pageSize: Int = 200,
+    // …every remaining field also defaulted
+)
+
+Json.encodeToString(Pagination.serializer(), Pagination())   // == "{}"   (verified)
+```
+
+Nothing throws, and the response is a success. An ASP.NET MVC endpoint binds the missing
+ints to `0`, so `PageSize = 0` returns zero rows with `ResponseStatusCode: 0`. Verified
+against a live server — same endpoint, same session, only the body differing:
+
+```
+paginationSetting: {}                          -> rows=0   status=0
+paginationSetting: {PageNumber:1,PageSize:200}  -> rows=14  status=0
+```
+
+The app reported "this server reports no controllers" against a server holding fourteen.
+
+Set it on the instance every request goes through:
+
+```kotlin
+val json = Json {
+    ignoreUnknownKeys = true
+    encodeDefaults = true      // required, not a preference — see above
+}
+```
+
+Two things this generalises to, both worse than a crash:
+
+- **A default that is semantically "off".** A search criterion whose `FunctionOperator`
+  defaults to `Is(1)` is dropped, the server reads `None(0)`, and the comparison is
+  ignored — so the filter silently stops filtering and returns everything.
+- **Any peer that coerces a missing value instead of rejecting it.** MVC model binding,
+  most form/query binders, and plenty of JSON APIs. Where the peer coerces, a wrong body
+  is indistinguishable from an empty result, so **assert the serialized bytes** in a test
+  rather than only that the object round-trips. See
+  [testing](../core/testing.mdc#a-test-that-rebuilds-production-configuration-proves-nothing).
+
+Prefer requiring the fields that must not be absent (no default at all) over relying on a
+serializer setting that a later refactor can drop.
+
+## `usesCleartextTraffic` does not cover raw sockets
+
+`android:usesCleartextTraffic` and `networkSecurityConfig` are enforced by the **HTTP stack** —
+`HttpURLConnection`, OkHttp, WebView — which consult
+`NetworkSecurityPolicy.isCleartextTrafficPermitted()`. Raw `Socket` and `DatagramSocket` never
+consult it, so the policy has no effect on them.
+
+Two consequences:
+
+- An app that talks to devices over raw TCP/UDP needs **neither** setting. Adding
+  `usesCleartextTraffic="true"` for it buys nothing and grants plaintext HTTP to the whole
+  internet. Verified: removing both left raw-socket discovery and commands working unchanged.
+- `networkSecurityConfig` cannot express "my LAN" anyway — `<domain>` takes a hostname or IP
+  literal, **not a CIDR range**, so a DHCP subnet cannot be enumerated.
+
+Declare only the permissions actually used. Check the manifest against the code: a
+`FOREGROUND_SERVICE` permission with no `<service>` declared, or `CHANGE_WIFI_STATE` for an app
+that only reads, is a review finding.
+
+### A `WebViewAssetLoader` app does not need `INTERNET` — test before believing otherwise
+
+There is a widely-repeated claim that a `WebView` served from assets over
+`https://appassets.androidplatform.net` still requires `INTERNET`, because Chromium gates the
+`URLRequest` on the permission *before* `shouldInterceptRequest` runs — and that without it you
+get a black screen and no `onPageFinished`.
+
+Tested on API 35 with the then-current WebView, that is false. With the permission removed from
+the merged manifest (confirmed absent via `aapt2 dump permissions <apk>`), an asset-hosted page
+loads and renders normally:
+
+```
+I MyApp: loaded: https://appassets.androidplatform.net/assets/index.html
+```
+
+The permission does change behaviour for requests you do **not** intercept: the favicon Chromium
+requests on its own failed as `ERR_CACHE_MISS` without it and `ERR_NAME_NOT_RESOLVED` with it.
+But an intercepted request never reaches the network stack's permission gate, so an app whose
+every resource comes from `assets` needs nothing.
+
+Worth the ten minutes to check, because the payoff is an app that ships with **zero** permissions
+— which for anything aimed at children is a materially better posture than a comment explaining
+why the one permission is harmless. Pair it with a `shouldInterceptRequest` that refuses any host
+but the asset host, so "offline" is enforced rather than asserted:
+
+```kotlin
+override fun shouldInterceptRequest(view: WebView, req: WebResourceRequest): WebResourceResponse? {
+    if (req.url.host != ASSET_HOST) return WebResourceResponse(null, null, null)
+    return assetLoader.shouldInterceptRequest(req.url)
+}
+```
+
+If a page ever does render blank on some other device or WebView build, re-test this before
+assuming the cause is elsewhere — the original claim came from somewhere, and may hold on an
+older WebView.
+
+### An HTTPS device on the LAN: pin the certificate, don't widen the policy
+
+*(For TLS that fails before any certificate is even checked, see
+[A pure-Java library is not automatically an Android library](#a-pure-java-library-is-not-automatically-an-android-library).)*
+
+The inverse case. When the device *does* speak HTTPS, it almost always presents a
+self-signed certificate and is addressed by IP literal — so **both** checks fail: no
+trusted chain, and no matching name. Observed on a Velocity server: subject `CN=localhost`,
+SAN `DNS Name=localhost`, and **no `iPAddress` SAN at all**, so hostname verification cannot
+pass however the URL is written. (For the server side of this, see the
+[windows-https-service](../../skills/windows-https-service/SKILL.md) skill.)
+
+Two tempting answers are both wrong. `networkSecurityConfig` cannot express a DHCP subnet
+(no CIDR), and a trust-all `X509TrustManager` — the shape most reference clients use, and
+what `verify=False` does in a Python script — makes every connection interceptable on a
+network an attacker can already reach.
+
+Pin instead, per server, on that server's own client:
+
+```kotlin
+// Accepts exactly one certificate. Stronger than a name match, because it identifies
+// the machine rather than any CA-signed name.
+class Pinned(private val expected: String?) : X509TrustManager {
+    override fun checkServerTrusted(chain: Array<out X509Certificate>?, authType: String?) {
+        val leaf = chain?.firstOrNull() ?: throw CertificateException("no certificate")
+        val actual = sha256Hex(leaf.encoded)
+        if (expected == null) { learned = actual; return }   // first connect only
+        if (!actual.equals(expected, ignoreCase = true))
+            throw CertificateException("fingerprint changed")
+    }
+    override fun getAcceptedIssuers() = emptyArray<X509Certificate>()   // empty, not null
+}
+
+OkHttpClient.Builder()
+    .sslSocketFactory(socketFactoryFor(trust), trust)
+    .hostnameVerifier { _, _ -> true }   // safe ONLY because a pin is installed
+    .build()
+```
+
+- **Learn the fingerprint once, with the user looking at it**, then store it. Trust-on-first-use
+  is only meaningful if the enrolment is deliberate.
+- **A changed fingerprint is a hard error**, never a silent re-pin.
+- **Scope it to one client instance.** A pin installed globally, or a
+  `HostnameVerifier` returning `true` without a pin, is the trust-all bug wearing a hat.
+- Return an **empty** array from `getAcceptedIssuers()` — some stacks call it and NPE on null.
+- **When the server is your own PC, avoid the problem instead.** If the phone is the owner's
+  and the service runs on the owner's Windows PC, publish it with `tailscale serve` as
+  `https://<pc>.<tailnet>.ts.net`: a real Let's Encrypt certificate, so the app uses normal TLS
+  with no pin. See section 7 of the
+  [windows-https-service](../../skills/windows-https-service/SKILL.md) skill.
+
+## A library's newest release can need a newer toolchain than yours
+
+Picking "the latest version" of a dependency silently couples you to the toolchain its authors
+built it with. Two checked from Maven Central on Oct-18-2026, for a project on AGP 8.7.2,
+Kotlin 2.0.21 and compileSdk 35:
+
+| Library | Latest | What it requires | Newest that fits |
+|---|---|---|---|
+| `org.maplibre.gl:android-sdk` | 13.7.1 | `kotlin-stdlib` **2.2.10** in its POM | 11.13.5 (stdlib 2.0.20) |
+| `net.zetetic:sqlcipher-android` | 4.19.1 | AAR metadata **`minCompileSdk`** 37 in 4.18.0 and 4.19.0, 36 in 4.19.1, and `kotlin-stdlib` 2.2.10 from 4.18.0 | 4.17.0 (`minCompileSdk=1`) |
+
+A Kotlin 2.0 compiler cannot reliably read 2.2 metadata, and AGP's AAR metadata check fails the
+build when `minCompileSdk` is above yours. Neither shows until the build, and by then the
+version is in the catalog. Check before choosing:
+
+```bash
+# Kotlin stdlib the library was built against
+curl -s https://repo1.maven.org/maven2/<group path>/<artifact>/<v>/<artifact>-<v>.pom | grep -A1 kotlin-stdlib
+# compileSdk it demands (inside the AAR)
+unzip -p <artifact>-<v>.aar META-INF/com/android/build/gradle/aar-metadata.properties
+```
+
+Take the newest version that fits, record why in a comment beside it in
+`gradle/libs.versions.toml` (so nobody "upgrades" it back), and move the toolchain on purpose
+when you want the newer line.
+
+## A pure-Java library is not automatically an Android library
+
+"Pure Java, no native code" means it *can* run on Android. It does not mean anyone has run
+it there. The gap between those two shows up in the transport layer, years after the library
+is otherwise stable, and it reports the wrong cause.
+
+**Android's TLS provider is Conscrypt, not SunJSSE.** The two drive an `SSLEngine`'s input
+differently, so a library whose stream handling is subtly wrong can be correct-by-accident on
+every desktop JVM and deadlock on every phone.
+
+Worked example — the Microsoft JDBC driver for SQL Server (`mssql-jdbc`) below **13.5.1**:
+
+- `TDSChannel.SSLHandshakeInputStream.readInternal` reads **exactly** `maxBytes`, blocking
+  until it has them, instead of reading **up to** `maxBytes` and returning the actual count —
+  which is what the `InputStream.read` contract requires.
+- **SunJSSE** asks for small, exact TLS-record-sized chunks, so it never requests more than is
+  available and the defect is invisible.
+- **Conscrypt** issues one large read (its buffer, ~16 KB). The driver blocks waiting for
+  bytes the server finished sending long ago, and both sides wait until `loginTimeout`.
+
+The symptom names the wrong subsystem. The reported error is
+`could not establish a secure connection … Read timed out`, so it reads as a firewall or
+certificate problem. In the driver's own tracker it was diagnosed that way twice
+([#1276](https://github.com/microsoft/mssql-jdbc/issues/1276),
+[#2423](https://github.com/microsoft/mssql-jdbc/issues/2423)) before being root-caused in
+[#2979](https://github.com/microsoft/mssql-jdbc/issues/2979).
+
+### Debug and release fail differently, from one cause
+
+D8 computes `assert` at compile time from whether the variant is **debuggable** — debug
+builds evaluate assertions, release builds compile them out. A library carrying internal
+`assert` statements therefore fails **twice, differently**:
+
+| Variant | Failure |
+|---|---|
+| Debug | `AssertionError` — fires early, names an internal invariant |
+| Release | Hangs to the timeout, then a transport error naming certificates or the network |
+
+Two unrelated-looking errors, one bug. Do not assume you are chasing two.
+
+### Before adopting a desktop JVM library on Android
+
+- **Search its issue tracker for "Android"** before writing code around it. Unsupported is
+  not the same as broken, but it tells you whose problem a failure will be.
+- **A fix being merged is not a fix being shipped.** Check which *release* carries it, and
+  whether that release is GA — the fix above sat in a `prerelease` build while the newest
+  stable release still predated it, so taking "the latest stable version" got you the bug.
+- **Pin the exact version, with a comment saying why.** Otherwise a later tidy-up
+  "upgrades" you to stable and silently reintroduces it.
+- **Test on hardware, in both build types.** An emulator shares the same TLS provider, so it
+  catches this one — but per the table above, debug alone does not tell you how release fails.
+- **"It compiles" and "it dexes" say nothing about runtime.** Neither does a desktop unit
+  test of the same library.
+
+## Serving TLS from the phone
+
+The section above is the phone as a TLS **client**. An app that is itself a TLS **server** (an
+embedded FTPS, HTTPS or WebSocket server on the LAN) has two further traps, both met building
+`ftp-server-android` (Apache FtpServer 1.2.1 on MINA 2.2.4) in Oct-2026.
+
+### A server key in AndroidKeyStore needs wider authorisations than "sign with SHA-256"
+
+The natural way to hold a server key is a non-exportable AndroidKeyStore key, created once and
+never written to disk. Conscrypt cannot read that key's material, so it signs the handshake
+through JCA calls on the key handle, and those calls ask for operations a "normal" signing key
+was not created for:
+
+- TLS 1.2 with RSA PKCS#1 signing goes through `NONEwithRSA` over a digest Conscrypt computed
+  itself, so the key must allow **`DIGEST_NONE`**.
+- RSA-PSS, which current clients offer first, is done as a raw RSA private operation
+  (`RSA/ECB/NoPadding`), so the key also needs **`PURPOSE_DECRYPT`** with
+  **`ENCRYPTION_PADDING_NONE`**, and `setRandomizedEncryptionRequired(false)` for that padding to
+  be accepted.
+
+The spec that works:
+
+```kotlin
+KeyGenParameterSpec.Builder(alias, KeyProperties.PURPOSE_SIGN or KeyProperties.PURPOSE_DECRYPT)
+    .setAlgorithmParameterSpec(RSAKeyGenParameterSpec(2048, RSAKeyGenParameterSpec.F4))
+    .setDigests(KeyProperties.DIGEST_NONE, KeyProperties.DIGEST_SHA256,
+                KeyProperties.DIGEST_SHA384, KeyProperties.DIGEST_SHA512)
+    .setSignaturePaddings(KeyProperties.SIGNATURE_PADDING_RSA_PKCS1,
+                          KeyProperties.SIGNATURE_PADDING_RSA_PSS)
+    .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE,
+                           KeyProperties.ENCRYPTION_PADDING_RSA_PKCS1)
+    .setRandomizedEncryptionRequired(false)   // the key never encrypts: no PURPOSE_ENCRYPT
+    .setCertificateSubject(X500Principal("CN=..."))
+    .build()
+```
+
+Hand the `PrivateKey` and certificate to the `SSLContext` through a small `X509ExtendedKeyManager`
+that returns that one alias, rather than a `KeyManagerFactory` over the AndroidKeyStore: the JVM
+tests then run the same key manager with a PKCS12 test key, and nothing depends on how the factory
+enumerates keystore entries.
+
+**Evidence, and its limits.** Verified Oct-18-2026 on a Nothing A009P: with this spec a PC
+client (Python `ssl`, OpenSSL) completed TLS 1.2 `ECDHE-RSA-AES128-GCM-SHA256` against the phone,
+the certificate SHA-256 matched the one the app displays, and an 8 MB file round-tripped byte for
+byte. The individual authorisations come from how Conscrypt is known to sign; this run proved the
+whole spec works, not that each item is necessary. If a device rejects the spec, an EC P-256 key
+(signed as `NONEwithECDSA`, needing only `DIGEST_NONE`) is the fallback. **None of this runs in a
+JVM unit test**, so a server key path is unverified until a real client has handshaken with a
+real phone.
+
+### TLS 1.3 broke small uploads on the protected data channel: serve TLS 1.2 until proven
+
+With TLS 1.3 enabled, small uploads over an FTPS data connection protected with `PROT P` failed
+with `426 Data connection error`: a test sending ten small files failed on 3 of 3 runs. Forcing the
+client to TLS 1.2 passed 3 of 3, and restricting the server to TLS 1.2 passed the whole suite 3
+more times. The likely cause (not proven) is TLS 1.3's post-handshake session tickets: the server
+sends them after the handshake, an uploading client never reads on that socket, and closing a
+socket with unread input makes the OS send RST, which discards the upload.
+
+- That was observed on the JVM (SunJSSE server, Commons Net client). Conscrypt also sends
+  post-handshake tickets, so assume the risk carries to the phone.
+- The same shape threatens any protocol that writes on a fresh TLS connection and closes it
+  without reading: FTPS data channels, one-shot upload sockets.
+- So: **enable only `TLSv1.2` on such a server**, write the reason next to the constant, and keep
+  a regression test that sends many small protected uploads in a row. Re-enable 1.3 only after
+  that test passes against the phone itself. On the phone, 10 of 10 small `PROT P` uploads passed
+  under TLS 1.2.
+- Reuse the control channel's TLS session on the data channel (one shared `SSLContext`). FileZilla
+  does this and warns when the server refuses; a test client should do it too (Python's
+  `FTP_TLS` needs `wrap_socket(..., session=self.sock.session)` in `ntransfercmd`).
+
+## Prefer a real minSdk
+
+`minSdk` should be justified by an API the app actually needs. A high value inherited from a
+project template silently excludes devices for no reason — check it rather than keeping it.
+
+## A feature that changes the system it reports on
+
+An app that only reads is easy to be honest about. Adding an "apply fix" or "auto-remediate"
+path brings a second class of failure — the operation works and the app says otherwise, or its
+fate is unknown and the app picks an answer — plus an audit obligation the read path never had.
+
+Before building one, read
+[remediation-tooling](../../skills/remediation-tooling/SKILL.md): verifying at the granularity
+you acted at rather than the one you found at, treating a client-side timeout as an unknown
+outcome instead of a failure, sizing the transport timeout above the operation timeout, and
+writing the audit record *before* the operation rather than after.
+
+## Robolectric at targetSdk 35 needs Java 21; bundle what Google Fonts actually ships
+
+Two toolchain facts found scaffolding learn-hindi (Nov-14-2026):
+
+- **Robolectric's SDK 35 runtime requires JDK 21.** On a machine whose `JAVA_HOME` is JDK 17,
+  every Robolectric test fails to start at SDK 35. Keep `compileSdk`/`targetSdk` 35 and pin the
+  test runtime instead, one file per Android module:
+  `src/test/resources/robolectric.properties` with `sdk=34`. Remove it when the build JDK is 21.
+- **google/fonts ships Noto Sans Devanagari and Noto Sans Tamil only as variable fonts**
+  (`NotoSansDevanagari[wdth,wght].ttf`), not static Regular/Bold. Bundle the one variable file
+  per script in `res/font` (lowercase name) and select weights through the `wght` axis
+  (`Font(..., variationSettings = FontVariation.Settings(FontVariation.weight(700)))`, an
+  `@OptIn(ExperimentalTextApi)` API in current BOMs). Check the bytes start `00 01 00 00` and
+  ship the OFL text. For mixed Hindi and Tamil in one `Text`, give each script run its own
+  `fontFamily` span: Compose has no per-script fallback inside one FontFamily. Never set
+  `letterSpacing` on Devanagari; it breaks conjunct shaping.
+
+## A lone combining mark draws a dotted circle (Devanagari and other Indic scripts)
+
+A vowel sign or mark (ि ी ु ं ँ ्) only draws properly attached to a letter. Shown by itself, as
+a lesson does when it teaches the sign, Android draws it on a dotted circle "◌". Seen in
+learn-hindi lesson 1 (Nov-14-2026), where the matra items are stored as the bare character.
+
+Fix it for display only: put a base letter under any mark that starts the text or follows a
+non-letter, and keep the bare character for speech, storage and matching.
+
+```kotlin
+fun anchorBareMarks(text: String): String {
+    fun isMark(c: Char) = c.code in 0x0900..0x0903 || c.code in 0x093A..0x093C ||
+        c.code in 0x093E..0x094F || c.code in 0x0962..0x0963
+    fun attaches(c: Char) = c.code in 0x0900..0x097F || c == '‍' || c == '‌'
+    if (text.none(::isMark)) return text
+    return buildString {
+        text.forEachIndexed { i, c ->
+            if (isMark(c) && (i == 0 || !attaches(text[i - 1]))) append('क')
+            append(c)
+        }
+    }
+}
+```
+
+Route every place that draws Hindi through it (a shared `withScriptFonts`-style helper, and any
+`Text` that sets the font directly). Unit-test `ि` to `कि` and that words with signs inside
+(`नमस्ते`, `हिंदी`) come back unchanged. The dotted circle does not show in Robolectric, so
+confirm on a device.
+
+## Compose layout tests: overlap rectangles, text height, scrolling
+
+Lessons from the learn-hindi kid map (Nov-14-2026):
+
+- **Do not lay a screen out as absolute offsets on a scaled board.** The map copied a design mock
+  as fixed `x, y` positions scaled to the window. Adding the English spelling made the labels
+  wider, and labels, level circles and the mascot overlapped; the dotted path ran through the
+  names. Use a `Column` of stops (and `BoxWithConstraints` for fractions of the width), so each
+  item gets its own space.
+- **Assert "no two siblings overlap" from rectangles.** Read each node with
+  `fetchSemanticsNode()`, take `positionInRoot` plus `size`, and fail on any intersection:
+
+  ```kotlin
+  fun rectOf(tag: String): Rect {
+      val n = rule.onNodeWithTag(tag).fetchSemanticsNode()
+      val p = n.positionInRoot
+      return Rect(p.x, p.y, p.x + n.size.width, p.y + n.size.height)
+  }
+  // for every pair: val o = a.intersect(b); assertFalse(o.width > 0f && o.height > 0f)
+  ```
+
+  Add `@Config(sdk = [34], qualifiers = "w411dp-h893dp")` to a test that a whole page fits
+  (the top item starts on screen, the last item ends above the bottom button).
+- **Do not assert text height or line count in Robolectric.** Its font metrics differ from the
+  phone: a 12sp Tamil label measured 36 px (two lines) there while the device showed one line.
+  Assert position and containment; judge wrapping from a device screenshot.
+- **Scroll before you click.** A node below the fold is not hit by `performClick()` on a small
+  test window (the callback count stayed 0). Use `performScrollTo().performClick()`.
+
+## Phone layout lessons from Helm (Nov-14-2026)
+
+- **Never put a scrolling component inside a lazy list item.** A `Column(Modifier.verticalScroll(...))`
+  (here `CenteredMessage` in Helm's `GateScreens.kt`) placed in a `LazyColumn` item crashed with
+  "Vertically scrollable component was measured with an infinity maximum height constraints" the
+  moment a History filter matched nothing; a populated list never showed it. Fixed in Helm commit
+  `bee7960` (the empty state is a plain `Column`). Empty, loading and error states inside a list
+  are plain composables; keep the scrolling full-screen variant for screens that are not list items,
+  and test the empty filter result, not only the populated one.
+- **At most 4 or 5 bottom-bar items; the rest go in a More screen.** Helm's seven `NavigationBarItem`s
+  clipped the selected label ("Command" lost its last letter) and wrapped others. Four tabs plus a
+  More menu fixed it (`HelmRoot.kt`, `MoreScreen.kt`). Check every label at font scale 1.0 and at
+  the largest setting before shipping a bar.
+- **Action rows use `FlowRow`, not `Row`.** Three buttons in a `Row` made one label wrap letter by
+  letter on a phone (the same starvation as the Row section above). Use
+  `FlowRow` (`@OptIn(ExperimentalLayoutApi::class)`) for button rows and status lines, as Helm's
+  `AgentsScreen.kt` does.
+
+## String resources: apostrophes, duplicate names, and a piped build (Nov-15-2026, Helm)
+
+Three build failures that name nothing useful.
+
+- **An unescaped apostrophe fails the build with no file or line.** A new `strings_admin.xml` held
+  `<string name="clean_body">This deletes the mission's code changes...</string>`. The build died in
+  `:app:mergeReleaseResources` (`ResourceCompilerRunnable`) with "Resource compilation failed (Failed
+  to compile values resource file ...merged.diraluesalues.xml. Cause:
+  java.lang.IllegalStateException: Can not extract resource from
+  com.android.aaptcompiler.ParsedResource@...)". Fix: write `mission's`, avoid the apostrophe, or
+  wrap the whole text in double quotes. A Python or shell heredoc that writes the XML can swallow the
+  backslash, so write the file with a real editor tool, or check the bytes after writing.
+- **A string name must be unique across every `res/values/*.xml`.** Adding
+  `<string name="repo_choose">` to `strings.xml` while the name already existed gave "Resource and
+  asset merger: Found item String/repo_choose more than one time". A project often has several
+  `strings_*.xml` files, so grep all of `res/values` (not one file) before adding a name. With
+  parallel agents adding strings, give each its own new file and a name prefix (`gapsa_`, `pcview_`).
+- **Never judge a Gradle run through a filter.** `gradlew -q ... | grep` printed nothing on a failed
+  build and the shell reported success. Read the `BUILD SUCCESSFUL` or `BUILD FAILED` line itself and
+  check the APK timestamp before installing or posting it.
+
+Checklist before a build that added strings: `grep -rn 'name="<new_name>"' app/src/main/res/values*`
+returns one hit, no text contains a bare `'`, and the build output ends in `BUILD SUCCESSFUL`.

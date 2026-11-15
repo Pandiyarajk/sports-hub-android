@@ -1,0 +1,399 @@
+---
+description: "PowerShell defects that produce no error at all: variables are case-insensitive, so `foreach ($s ...)` overwrites an outer `$S`; `-match` against an array never sets `$Matches`, `Set-Content` / `Out-File -Encoding UTF8` write a BOM that Python's JSON reader and a gh PR body choke on, a string with embedded double quotes passed to a native program loses the quotes or splits into extra arguments (and an empty-string argument is dropped outright), piping a string to a native program can prepend a UTF-8 BOM to its stdin, and a user/machine env var set with SetEnvironmentVariable or setx stays invisible to every process already running and to its children. Each lets a script report success while losing its data."
+globs: **/*.ps1, **/scripts/**/*.ps1
+alwaysApply: false
+---
+
+# PowerShell Silent Failures
+
+The defects below were reproduced on **Windows PowerShell 5.1**. None raises
+an error at the point of the mistake: the script keeps running, exits `0`, and
+the data is simply gone — the symptom surfaces somewhere else, in a different
+program.
+
+## 1. `-match` against an array does not populate `$Matches`
+
+`string -match pattern` is a boolean test that sets `$Matches`.
+`array -match pattern` is a **filter**: it returns the elements that match. A
+non-empty result is truthy, so an `if` guard passes — but `$Matches` was never
+touched.
+
+### Reproduction
+
+```console
+PS> $arr = @("package: name='com.example.demo' versionCode='7' versionName='1.2'",
+             "sdkVersion:'26'")
+
+PS> if ($arr -match "versionName='([^']+)'") { $Matches[1] }
+Cannot index into a null array.        <-- guard passed, $Matches never set
+
+PS> ($arr -join "`n") -match "versionName='([^']+)'"; $Matches[1]
+True
+1.2
+```
+
+### Why it bites
+
+The output of a native command is an **array of lines**, so the
+idiomatic-looking form is wrong exactly where it is most tempting:
+
+```powershell
+$output = & $aapt2 dump badging $apk      # array, one element per line
+if ($output -match "versionName='([^']+)'") { $Matches[1] }   # always empty
+```
+
+In the real case this made a build script record package, `versionName` and
+`versionCode` as `"unknown"` for **every** build. Under
+`$ErrorActionPreference = "Stop"` the null index does worse than return
+nothing — it aborts the script immediately *after* a successful compile, which
+points suspicion at the build step rather than the parse.
+
+### The fix
+
+Join to a single string before matching:
+
+```powershell
+$text = (& $tool @args) -join "`n"
+if ($text -match "versionName='([^']+)'") { $verName = $Matches[1] }
+```
+
+Rule of thumb: **`$Matches` is only trustworthy when the left operand is a
+single string.** If you cannot see that it is one, join it first.
+
+## 2. `Set-Content -Encoding UTF8` writes a BOM
+
+Windows PowerShell 5.1's `-Encoding UTF8` means *UTF-8 with BOM*; that cmdlet
+has no BOM-less UTF-8 option.
+
+### Reproduction
+
+First three bytes of the written file:
+
+```console
+$json | Set-Content $p -Encoding UTF8
+  -> 239,187,191                  <-- EF BB BF, the BOM
+
+[IO.File]::WriteAllText($p, $json, (New-Object Text.UTF8Encoding $false))
+  -> 123,13,10                    <-- '{', as intended
+```
+
+And on the consuming side:
+
+```console
+>>> json.loads(path.read_text(encoding="utf-8"))
+json.decoder.JSONDecodeError: Unexpected UTF-8 BOM (decode using utf-8-sig)
+```
+
+### Why it bites
+
+The producer succeeds. The file opens correctly in every editor. The consumer
+throws the **whole file** away. In the real case a `manifest.json` written by a
+build script was discarded by the installer that read it, and the only symptom
+was a single warning line — so every APK silently lost its package and version
+metadata.
+
+### The fix — both sides
+
+```powershell
+# write: no BOM, explicit
+[IO.File]::WriteAllText($path, $text, (New-Object Text.UTF8Encoding $false))
+```
+
+```python
+# read: accepts a file with or without a BOM
+json.loads(path.read_text(encoding="utf-8-sig"))
+```
+
+Do both. Fixing only the writer leaves every file already on disk broken;
+fixing only the reader leaves the next consumer — jq, a Java parser, a shell
+script — to hit it instead.
+
+Same failure mode [no-secrets](../core/no-secrets.mdc) already guards against
+for `.env` files ("UTF-8 without a BOM ... with no error raised") — seen here
+from the writing side, across a language boundary.
+
+**This is a 5.1 defect.** Re-measured Oct-19-2026 on PowerShell 7.6.7: `Set-Content -Encoding UTF8`,
+`Out-File -Encoding utf8` and `>` all wrote no BOM (first bytes `120,13,10`), and only
+`-Encoding utf8BOM` wrote `239,187,191`. So a script that behaves in `pwsh` can still break under
+5.1, and the `WriteAllText` fix below is correct in both.
+
+`Out-File -Encoding utf8` (and therefore `>` in a 5.1 session configured for
+UTF-8) does the same on 5.1: verified Oct-13-2026, first bytes `239,187,191`. A PR body
+written that way and passed as `gh pr create --body-file` went up with an
+invisible BOM before `## What`, so GitHub rendered the first heading as the
+literal text `?## What`. Write such files with the `WriteAllText` line above.
+
+## 3. Native arguments with embedded double quotes are mangled
+
+Windows PowerShell 5.1 does not escape `"` when it builds the command line for a
+native program (`git`, `gh`, `python`, any `.exe`). The receiving program parses
+the quotes as its own: they disappear, and any space inside a quoted phrase
+splits the string into separate arguments. A here-string does not help; the
+damage happens when the argument is passed, not when it is written.
+
+### Reproduction
+
+Verified Oct-13-2026, PowerShell 5.1.26100:
+
+```powershell
+$py = 'C:\Python313\python.exe'
+& $py -c "import sys; print(len(sys.argv)-1, sys.argv[1:])" 'Fix "quoted" text'
+#  -> 1 ['Fix quoted text']                               quotes silently gone
+& $py -c "import sys; print(len(sys.argv)-1, sys.argv[1:])" 'Fails with "No SQL Server instances found" on start'
+#  -> 5 ['Fails with No', 'SQL', 'Server', 'instances', 'found on start']
+```
+
+### Why it bites
+
+The no-space case is fully silent: a commit message or PR title quietly loses
+its quotes. The split case fails far from the cause:
+`git commit -m $msg` reported `error: pathspec 'SQL' did not match any file(s)`
+(the words became pathspecs), and `gh pr create --body $text` reported
+`unknown arguments [...]`. Nothing points at the quoting.
+
+### The fix
+
+Do not pass free text containing `"` as a native argument. Write it to a file
+(BOM-less, see section 2) and pass the file:
+
+```powershell
+[IO.File]::WriteAllText($f, $msg, (New-Object Text.UTF8Encoding $false))
+git commit -F $f
+gh pr create --title "Short title" --body-file $f
+gh api -X PATCH repos/<owner>/<repo>/pulls/<n> -F "body=@$f"
+```
+
+Windows PowerShell 5.1 has no switch for this, so the file route is the fix
+there.
+
+### An empty-string argument is dropped entirely
+
+The same command-line builder also **drops** an empty string. The program
+receives one argument fewer, so a flag that takes a value swallows the *next*
+argument instead, or runs with its default. Verified Oct-25-2026,
+PowerShell 5.1.26100.9549:
+
+```powershell
+$py = 'C:\Python313\python.exe'
+$probe = "import sys; print(len(sys.argv)-1, sys.argv[1:])"
+& $py -c $probe a '' b               #  -> 2 ['a', 'b']        '' vanished
+& $py -c $probe a "" b               #  -> 2 ['a', 'b']
+$e = ''; & $py -c $probe a $e b      #  -> 2 ['a', 'b']        a variable is no better
+$x = @('-c', $probe, 'a', '', 'b'); & $py @x   #  -> 2 ['a', 'b']   nor is splatting
+```
+
+Seen as `claude -p --tools ""`: the empty value never arrived, so the tools
+stayed enabled and their listings came back into the prompt, with no error.
+
+**Fix: build the call as an argument list in Python** — `subprocess` quotes an
+empty item as `""` itself:
+
+```powershell
+& $py -c "import subprocess,sys; subprocess.run([sys.executable,'-c','import sys; print(len(sys.argv)-1, sys.argv[1:])','a','','b'])"
+#  -> 3 ['a', '', 'b']
+```
+
+Workarounds that also passed on 5.1.26100.9549 (same probe):
+
+```powershell
+& $py -c $probe a '""' b             #  -> 3 ['a', '', 'b']   literal quote pair
+& $py --% -c "import sys; print(len(sys.argv)-1, sys.argv[1:])" a "" b
+                                     #  -> 3 ['a', '', 'b']   stop-parsing: no PS variables after it
+& $py -c $probe --tools= b           #  -> 2 ['--tools=', 'b'] only if the program accepts --flag=
+```
+
+Each is a 5.1-only habit: `'""'` was not re-measured on PowerShell 7 (no
+`pwsh` on the test machine), whose `$PSNativeCommandArgumentPassing` rules
+differ (see below), and `--%` cannot take a PowerShell variable. The Python
+argument list is the one route that does not depend on the shell.
+
+### `-F -` reads stdin, and the chain keeps going after a failed commit
+
+`git commit -F -` takes the message from **standard input**. A here-string written after it is
+a second argument, so git treats it as a pathspec and commits nothing. PowerShell does not stop
+a script when a native command exits non-zero, so the `checkout`, `merge` and `branch -d` that
+follow all run. Reproduced Oct-19-2026, PowerShell 7:
+
+```powershell
+git commit -q -F - @'
+Subject line
+
+Body line.
+'@
+#  error: pathspec 'Subject line ... Body line.' did not match any file(s)   (exit 1)
+git checkout -q main; git merge --no-ff -q feature   # exit 0, "Already up to date"
+git branch -d feature                                # Deleted branch feature (nothing was lost only by luck)
+```
+
+Pipe the text, or pass a file, and stop the chain on failure:
+
+```powershell
+$msg | git commit -q -F -                 # stdin, not an argument
+git commit -q -F $f                       # or a BOM-less file, as above
+if ($LASTEXITCODE -ne 0) { throw "commit failed" }   # PowerShell 5.1 and 7
+# PowerShell 7 only: git commit -q -F $f && git switch main && git merge --no-ff feature
+```
+
+The matching git-side check is in [source-control](../core/source-control.mdc): count the commits
+ahead of `main` before merging.
+
+### PowerShell 7 is the opposite trap: escapes arrive literally
+
+PowerShell 7.3+ (`$PSNativeCommandArgumentPassing = Windows`) passes embedded
+quotes through correctly, so the 5.1 habit of backslash-escaping them now
+breaks the argument instead. Verified Oct-18-2026, PowerShell 7.6.7:
+
+```powershell
+& python -c "import sys; print(sys.argv[1:])" '.[] | \"\(.login) x\"'
+#  -> ['.[] | \\"\\(.login) x\\"']      backslashes delivered to the program
+& python -c "import sys; print(sys.argv[1:])" '.[] | "\(.login) x"'
+#  -> ['.[] | "\\(.login) x"']          what jq actually needs
+```
+
+Seen as `gh api ... --jq '.[] | \"\(.login)\"'` failing with
+`failed to parse jq expression ... unexpected token "\\"`. In PowerShell 7 write
+the quotes plainly inside a single-quoted string; in 5.1 use a file or a filter
+without embedded quotes (`--jq '.[].login'`). Check `$PSVersionTable.PSVersion`
+before reusing a quoting recipe from the other edition.
+
+## 4. A user or machine env var set now is invisible to everything already running
+
+`[Environment]::SetEnvironmentVariable('X', 'v', 'User')` and `setx X v` write the registry
+(`HKCU\Environment`, or HKLM for machine) immediately and say nothing more. Every process that
+was already running keeps the environment block it started with, and so does **every child it
+launches**: a child copies its parent's block, it does not re-read the registry. A terminal, an
+IDE, or an assistant session opened before the change reports the variable as unset, and the
+usual next step (ask for the secret again, or "set it" a second time) fixes nothing.
+
+### Reproduction
+
+```powershell
+[Environment]::SetEnvironmentVariable('HUB_DEMO', 'set', 'User')
+powershell -NoProfile -Command '[bool]$env:HUB_DEMO'                   # -> False  (inherited block)
+(Get-ItemProperty HKCU:\Environment).HUB_DEMO                         # -> set    (the truth)
+[Environment]::SetEnvironmentVariable('HUB_DEMO', $null, 'User')      # clean up
+```
+
+Measured Oct-18-2026: `TG_API_ID` / `TG_API_HASH` saved to the user scope from a session, then a
+fresh `powershell -NoProfile` started from that session printed `False` for both while
+`HKCU:\Environment` held them (the hash at its full 32 characters).
+
+### The fix
+
+Before concluding a variable is missing, read the registry, not `$env:`. Refresh one in place
+with `$env:X = [Environment]::GetEnvironmentVariable('X', 'User')`, and have tools that run
+from long-lived shells fall back to the registry themselves (Python: `winreg` on
+`HKCU\Environment`). `D:\GitHub\tools\envget` does both lookups and shows every place a name is
+stored (process, `HKCU\Environment`, `HKCU\Volatile Environment`, HKLM) with the copy that wins;
+`envget --diff` lists every variable whose copies disagree. The tgpost token case in
+[android-deploy](../../skills/android-deploy/SKILL.md) (`401 Unauthorized`
+from a terminal opened before the token was rotated) is the same defect.
+
+## 5. Bash syntax in a PowerShell call fails at parse time, so nothing before it runs
+
+This one is loud, not silent, but it misleads the same way: the error points at the bash line, and a
+reader assumes the lines above it ran. PowerShell parses the **whole** script before executing any
+of it. A bash heredoc (`cat <<'EOF'`) is a parse error, so the earlier commands never ran.
+Reproduced Oct-19-2026, PowerShell 7.6.7, a script of `Write-Output 'ran first'` then `cat <<'EOF'`:
+
+```
+ParserError: hd.ps1:2
+   2 |  cat <<'EOF'
+     |       ~
+     | Missing file specification after redirection operator.
+```
+
+`ran first` was never printed. The cure is to write the shell the tool is: use a PowerShell
+here-string (`@'`...`'@`, closing marker at column 0) in a PowerShell call, or call the Bash tool
+for a heredoc. When a call fails like this, assume **nothing** in it executed rather than
+"everything up to the bad line".
+
+## 6. Variable names are case-insensitive, so a loop variable can overwrite another variable
+
+`$S` and `$s` are the same variable. A `foreach ($s in $list)` written for "screen" silently
+replaces an outer `$S` that held something else, and nothing warns.
+
+### Reproduction (Oct-30-2026, PowerShell 7.6.9 and Windows PowerShell 5.1, same result)
+
+```powershell
+$S = "00369766H004012"            # adb device serial
+foreach ($s in @("03-add-sms")) { }
+"after loop, `$S = $S"             # -> after loop, $S = 03-add-sms
+```
+
+### Why it bites
+
+A screenshot script used `$S` for the device serial and `foreach ($s in $screens)` for the pages.
+The first two shots (taken before the loop) worked; every later `adb -s $S ...` ran as
+`adb -s 03-add-sms ...` and adb printed `unknown command 03-add-sms`, which reads like an adb
+problem, not a variable problem.
+
+### The fix
+
+Never tell variables apart by case alone. Give loop variables distinct names (`$item`, `$page`)
+and long-lived ones descriptive names (`$serial`, not `$S`).
+
+## 7. Piping a string to a native program can prepend a BOM to its stdin
+
+`'value' | some.exe` sends PowerShell's text through the console input encoding. When
+that encoding is UTF-8 *with* a preamble, the program's stdin starts with `EF BB BF`.
+Nothing errors: the receiver just sees three extra bytes before your value.
+
+### Reproduction (Nov-10-2026, Windows PowerShell 5.1, with and without `-NoProfile`)
+
+```powershell
+[Console]::InputEncoding.GetPreamble().Length            # 3 on the affected host
+'abc' | python -c "import sys; print(list(sys.stdin.buffer.read()))"
+# [239, 187, 191, 97, 98, 99, ...]
+```
+
+`$OutputEncoding` is not the cause: it read `US-ASCII` (and setting it to BOM-less UTF-8
+changed nothing) while the BOM still arrived.
+
+### Why it bites
+
+A secret piped this way never equals itself. Seen Nov-09-2026: a script compared a piped
+password with the known-good one, got `False`, and refused to deploy it; the same value
+passed to `smtplib.login` raised `UnicodeEncodeError` (the BOM decodes as non-ASCII).
+Both looked like a wrong password.
+
+### The fix
+
+- Pass values to native programs in an environment variable or a file, not on a pipe:
+  `$env:X = 'abc'` then read `os.environ['X']` delivers the exact bytes `[97, 98, 99]`.
+- If you must pipe, set `[Console]::InputEncoding = New-Object System.Text.UTF8Encoding $false`
+  first. That removes the BOM but the pipe still appends `\r\n` (`[97, 98, 99, 13, 10]`),
+  so strip it on the reading side.
+- On the reading side, accept both:
+  `sys.stdin.buffer.read().removeprefix(b"\xef\xbb\xbf").decode().strip()`.
+
+## Verify
+
+Run these on your own machine; none needs a project:
+
+```powershell
+# 1. array -match leaves $Matches unset
+$Matches = $null
+@("versionName='1.2'", "other") -match "versionName='([^']+)'" | Out-Null
+if ($null -eq $Matches) { "BUG: array -match did not set `$Matches" }
+
+# 2. -Encoding UTF8 emits EF BB BF
+"{}" | Set-Content "$env:TEMP\bom.json" -Encoding UTF8
+[IO.File]::ReadAllBytes("$env:TEMP\bom.json")[0..2] -join ','   # -> 239,187,191
+
+# 3. embedded quotes split a native argument
+& python -c "import sys; print(len(sys.argv)-1, sys.argv[1:])" 'a "b c" d'   # -> 2 ['a b', 'c d']
+& python -c "import sys; print(len(sys.argv)-1, sys.argv[1:])" a '' b          # -> 2 ['a', 'b']
+
+# 4. a user env var set now does not reach a child of this shell
+[Environment]::SetEnvironmentVariable('HUB_DEMO', 'set', 'User')
+powershell -NoProfile -Command '[bool]$env:HUB_DEMO'                   # -> False
+[Environment]::SetEnvironmentVariable('HUB_DEMO', $null, 'User')
+
+# 6. a differently-cased loop variable overwrites the outer one
+$S = 'serial'; foreach ($s in @('page')) { }; $S                    # -> page
+```
+
+Expect `BUG: array -match did not set $Matches`, `239,187,191`, `2 ['a b', 'c d']`,
+`2 ['a', 'b']` and `page`. If you
+see them, the defects are live in your shell.

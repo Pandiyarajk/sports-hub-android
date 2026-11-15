@@ -1,0 +1,38 @@
+---
+description: Phone-to-PC (or phone-to-server) commands that must not be lost: why "written to the socket" is not delivery, and the receipt, outbox, retry, visible state and server log line a command needs. Request when an Android app sends an approval, a command, a payment-like or irreversible action to a server over WebSocket, TCP or any link that can drop.
+globs: **/*.kt, **/*.py, **/*.schema.json
+alwaysApply: false
+---
+
+<!--
+Author: Pandiyaraj Karuppasamy
+Date: Nov-14-2026
+-->
+
+# Phone to server commands: acknowledge, retry, show, log
+
+**Rule.** Any phone command that must not be lost needs all four of: a **receipt** from the
+server, a **retry** on the phone, a **visible state** in the UI, and a **server-side log line** for
+every receipt. Writing to the socket is not delivery.
+
+**Evidence (Helm, Nov-14-2026).** Approval answers showed "sent" on the phone while the PC never
+received them; the Core log held no trace. The send had succeeded locally on a link that was
+already dead.
+
+**What fixed it**
+- Server: `_send_ack` in `bridge/src/helm_core/gateway.py` replies at once with an `ack` frame
+  (`accepted`, `duplicate`, or `refused` with a code) and logs every receipt. The frame is defined
+  in `protocol/schemas/ack.schema.json` and documented in `protocol/README.md` (section "ack").
+  Duplicate detection makes a resend safe.
+- Phone: the answer sits in an outbox (`data/ApprovalOutbox.kt`, driven from `HelmRepository.kt`)
+  until an ack or the approval is resolved. It resends after about 4 s, up to 5 times with growing
+  waits, and again on every reconnect.
+- UI (`ApprovalsScreen.kt`): the card shows sent, received by the PC, retrying, then "not
+  confirmed" with a Retry button. Never a bare "sent".
+
+**Checklist when designing such a command**
+1. Give it an id; the server must treat a repeat of the same id as `duplicate`, not as a new act.
+2. Server acks before doing slow work, and says why when it refuses.
+3. Server logs one line per receipt (id, type, outcome), so "did it arrive" is answerable from the log.
+4. Phone keeps the command until ack, bounds the retries, and retries on reconnect.
+5. Test the lossy path: drop the link after the write and assert the retry and the final state.

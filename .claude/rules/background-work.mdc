@@ -1,0 +1,209 @@
+---
+description: Background work on Android: why a periodic WorkManager schedule is a request the system rations by standby bucket, how to read what the phone actually decided, asking for the battery-optimisation exemption, and the OEM restriction that exemption does not cover, and exact alarms for a user-set time (USE_EXACT_ALARM versus SCHEDULE_EXACT_ALARM, denied by default on Android 14+; re-arming; atomic fire-or-cancel). Request when scheduling periodic or deferred work, an alarm or reminder at a set time, when a sync or notification arrives late or not at all, or when adding a background refresh.
+globs: **/*.kt, **/AndroidManifest.xml
+alwaysApply: false
+---
+
+# Background work (WorkManager, Doze, standby buckets and exact alarms)
+
+Sibling of [android-app](android-app.mdc), [ci-cost](ci-cost.mdc) and
+[release-build](release-build.mdc). On-device verification is the
+[android-deploy](../../skills/android-deploy/SKILL.md) skill.
+
+This rule exists because the failure mode is **nothing at all**. No crash, no log line, no
+exception — the worker simply runs less often than the code says, and the code keeps reading
+correct forever. Nobody debugs a feature that looks like it works.
+
+## The interval you ask for is a request, not a promise
+
+`PeriodicWorkRequest` sets a floor of 15 minutes, and that is the *least* of it. Android
+puts every app in a **standby bucket** and rations its jobs accordingly. The bucket is not
+a detail you can reason about from the code — you have to ask the phone.
+
+Verified from the platform source (`android/app/usage/UsageStatsManager.java`, android-37.0
+— lower number means fewer restrictions):
+
+```
+STANDBY_BUCKET_EXEMPTED    =  5
+STANDBY_BUCKET_ACTIVE      = 10
+STANDBY_BUCKET_WORKING_SET = 20
+STANDBY_BUCKET_FREQUENT    = 30
+STANDBY_BUCKET_RARE        = 40
+STANDBY_BUCKET_RESTRICTED  = 45
+STANDBY_BUCKET_NEVER       = 50
+```
+
+Measured on a real phone (Android 15) after a fresh install of an app scheduled to sync
+every 30 minutes:
+
+```
+$ adb shell am get-standby-bucket com.example.app
+40                                    # RARE - jobs rationed to a handful a day
+$ adb shell dumpsys deviceidle whitelist | grep com.example.app
+                                      # nothing: not exempt from Doze
+```
+
+A newly installed app that has barely been opened is *exactly* the app the system considers
+idle. So "every 30 minutes" was, in practice, a couple of runs a day. For anything whose
+whole purpose is timeliness — a notification that something was posted — that is the same
+as not working.
+
+## Ask for the exemption, and only while it is missing
+
+```kotlin
+fun isUnrestricted(context: Context): Boolean {
+    val power = context.getSystemService(PowerManager::class.java) ?: return true
+    return power.isIgnoringBatteryOptimizations(context.packageName)
+}
+
+@SuppressLint("BatteryLife")            // see justification below
+fun requestUnrestricted(context: Context) {
+    val direct = Intent(
+        Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+        Uri.fromParts("package", context.packageName, null),
+    )
+    // Not every ROM ships the dialog; fall back rather than doing nothing.
+    if (start(context, direct)) return
+    if (start(context, Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))) return
+    openAppSettings(context)
+}
+```
+
+with `<uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />`
+in the manifest — without it the intent does nothing.
+
+Granting it moves the app out of the rationed buckets entirely. Same phone, same app,
+immediately after:
+
+```
+$ adb shell dumpsys deviceidle whitelist | grep com.example.app
+user,com.example.app,10489
+$ adb shell am get-standby-bucket com.example.app
+5                                     # EXEMPTED
+```
+
+Rules for asking:
+
+- **Only while the exemption is missing.** Read `isIgnoringBatteryOptimizations` and show
+  the prompt from that, so granting it removes the prompt permanently. Never a launch-time
+  dialog fired unconditionally.
+- **Re-read on resume.** The user returns from a system dialog, not from a callback;
+  `LifecycleEventEffect(Lifecycle.Event.ON_RESUME)` is enough. Without it the warning sits
+  there after being satisfied, which teaches people to ignore it.
+- **`BatteryLife` lint is suppressible only with a reason.** The check exists to stop Play
+  apps asking casually. An internal or sideloaded app whose only function is timely
+  notification has a real answer; write it in the suppression comment.
+- Grant it without tapping when testing:
+  `adb shell dumpsys deviceidle whitelist +com.example.app` (`-` to remove) — it writes the
+  same `user` list the dialog does.
+
+## The exemption does not cover the OEM's own restriction
+
+The Doze whitelist is AOSP. Several skins add a **separate** per-app control that it does
+not touch — MIUI/HyperOS "Autostart" is the common one — and an app can be battery-exempt
+and still have its background work killed. There is no API for it and adb cannot set it, so
+the only honest handling is to send the user to the page that has it:
+
+```kotlin
+Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+       Uri.fromParts("package", context.packageName, null))
+```
+
+Offer it as a second action next to the exemption prompt, and say in the UI that it is
+separate. Do not claim the app is unrestricted just because the AOSP check passes.
+
+## Read what the phone decided; do not infer it from the code
+
+The schedule you registered and the schedule the system will honour are different facts.
+`dumpsys jobscheduler` holds the second one, and it answers in seconds — no waiting for a
+period to elapse:
+
+```
+$ adb shell dumpsys jobscheduler | grep -A20 com.example.app
+  JOB #u0a489/3: com.example.app/androidx.work.impl.background.systemjob.SystemJobService
+      Requires: charging=false batteryNotLow=false deviceIdle=false
+    Satisfied constraints:   CONNECTIVITY FLEXIBILITY DEVICE_NOT_DOZING WITHIN_QUOTA
+    Unsatisfied constraints: TIMING_DELAY
+    Enqueue time: -28m15s527ms
+    Run time: earliest=+1m44s419ms, latest=none
+```
+
+How to read it:
+
+- **The job exists at all** — if `grep` finds nothing, `enqueueUniquePeriodicWork` never
+  landed, and no amount of waiting will help.
+- **`Enqueue time` + `Run time`** together give the real period: enqueued 28m ago, next run
+  in 1m44s, so this is a live 30-minute cycle that has already completed at least one lap.
+  This is the proof the loop is running, and it is available immediately.
+- **`Unsatisfied: TIMING_DELAY` alone is healthy** — it means "waiting for its window".
+  Anything else unsatisfied (`CONNECTIVITY`, `WITHIN_QUOTA`) is the actual reason it is not
+  running, and `WITHIN_QUOTA` in particular points straight back at the standby bucket.
+
+Do not verify this by launching the app: opening it usually triggers a foreground refresh,
+which overwrites the very timestamp you were about to inspect.
+
+## Design so that a deferred run is harmless
+
+Even exempt, Doze and quotas mean a run can be late. Anything that depends on the schedule
+being punctual is already broken.
+
+- **Derive "what is new" from persisted state, not from "since the last run".** Keep a set
+  of keys you have already seen and diff against it. A run that is two hours late then
+  reports the same set; a run that never happened loses nothing.
+- **Seed silently on the first successful run.** On a fresh install every item on the server
+  is "new". Measured in one case: roughly 350 notifications on first sync. Record the keys,
+  notify nothing, set a `seeded` flag.
+- **If the seen-set and the seeded flag can disagree, that is a notification flood waiting
+  to happen.** Keys built from an enum name are one way it happens under R8 — see
+  [release-build](release-build.mdc).
+- **Bound the work per run.** Cap secondary fetches (detail pages, per-item requests) so one
+  refresh cannot turn into ninety and get killed halfway.
+- **Put an active-hours check inside the worker**, returning success early, rather than
+  trying to express it in the schedule. A periodic request has no calendar, and a worker
+  that returns early costs nothing.
+- **One notification per group, not per item.** A batch that arrives at once — a day of
+  homework, a backlog after a late run — must collapse, or a single event is indistinguishable
+  from spam.
+
+## Exact alarms (AlarmManager): a user-set time
+
+WorkManager is for "about every N minutes". When the user picked the time (a reminder, a
+scheduled send), use `AlarmManager.setExactAndAllowWhileIdle`, and know where it is denied.
+
+- **Android 14+ denies `SCHEDULE_EXACT_ALARM` by default** for a fresh install of an app
+  targeting 33+. Code that calls `setExact*` and falls back on `SecurityException` will
+  quietly fall back to an inexact alarm on every new phone.
+- **`USE_EXACT_ALARM` (API 33+) is granted at install and cannot be revoked.** Declare it,
+  and keep `SCHEDULE_EXACT_ALARM` only for API 31 and 32 with `android:maxSdkVersion="32"`.
+  Verified Oct-30-2026 (`flash-sms`, Nothing A009P, Android 16): `dumpsys package` showed
+  `USE_EXACT_ALARM: granted=true` before the app asked for anything, and `dumpsys alarm` read
+  `exactAllowReason=policy_permission` on the scheduled alarm. **Caveat (Play policy, not
+  measured):** Google Play allows `USE_EXACT_ALARM` only for apps whose core function is an
+  alarm, timer or calendar-like schedule; a sideloaded tool is fine, a Play app must justify it.
+- **Still check `canScheduleExactAlarms()`** below 33 and offer the settings screen; fall back
+  to `setAndAllowWhileIdle` rather than failing.
+- **Alarms do not survive a reboot.** Store the schedule yourself and re-arm from
+  `BOOT_COMPLETED`. Re-arm on `MY_PACKAGE_REPLACED` and on app open too: both are cheap, and
+  they cover an update and a force-stop without having to prove what each one clears.
+  (A force-stop test by counting `dumpsys alarm` entries was **inconclusive**: that dump
+  includes recent history, so the counts are not live alarms. Do not cite such a count.)
+- **Decide what a missed alarm means.** Firing a reminder or message hours late is worse
+  than reporting the miss. `flash-sms` sends one missed by up to 6 hours on re-arm and marks
+  an older one failed with a notification.
+- **Make "fire" and "cancel" claim the item atomically.** The alarm and a user's cancel can
+  land together; both should move the item out of PENDING with one locked compare-and-set,
+  so exactly one wins and a late cancel says so instead of claiming success.
+
+## Verify
+- [ ] `adb shell am get-standby-bucket <pkg>` — know the number, and know that a fresh
+      install sits in 40 (RARE) until the app is used.
+- [ ] `adb shell dumpsys jobscheduler | grep -A20 <pkg>` shows the job, with `TIMING_DELAY`
+      as the only unsatisfied constraint.
+- [ ] The exemption prompt appears only while `isIgnoringBatteryOptimizations` is false, and
+      clears on resume after granting.
+- [ ] The manifest declares `REQUEST_IGNORE_BATTERY_OPTIMIZATIONS`, and the `BatteryLife`
+      suppression carries a reason.
+- [ ] The first successful run seeds without notifying.
+- [ ] A late run produces the same result as a punctual one.
+- [ ] Exact alarms: `dumpsys package <pkg> | grep USE_EXACT_ALARM` reads `granted=true`, and
+      `dumpsys alarm` shows the alarm with an `exactAllowReason`; re-armed after a reboot.

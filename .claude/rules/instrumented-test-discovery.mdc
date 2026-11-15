@@ -1,0 +1,134 @@
+---
+description: An Android instrumented-test task reports BUILD SUCCESSFUL when it runs zero tests — an absent androidTest source set is not an error, and produces no result XML to notice. Assert a non-zero test count from the result XML instead of trusting the exit code. Also covers filtering to one class (`--tests` is not valid here) and the PowerShell quoting that makes the filter fail with a misleading task-not-found error. Request when running, wiring up or relying on connectedAndroidTest / connectedDebugAndroidTest, or when a documented device-only guarantee (Room migrations, DAO behaviour) needs proving.
+globs: **/build.gradle.kts, **/build.gradle, **/src/androidTest/**/*.kt, .github/workflows/*.yml
+alwaysApply: false
+---
+
+# Instrumented test discovery
+
+Sibling of [android-app](android-app.mdc) and [ci-cost](ci-cost.mdc). Getting the
+build onto the phone in the first place is the
+[android-deploy](../../skills/android-deploy/SKILL.md) skill.
+
+`connectedAndroidTest` is where the guarantees live that a JVM test cannot reach:
+Room migrations, real SQLite semantics, DAO behaviour. It is also the task most
+likely to tell you it verified them when it verified nothing.
+
+This is the Android sibling of
+[suite-discovery-guard](../playwright/suite-discovery-guard.mdc). There the suite
+*shrank*; here it can be **entirely absent**, which is worse and harder to see.
+
+## The bug shape
+
+A repo's own notes said, as a hard rule:
+
+> No `fallbackToDestructiveMigration()`, ever. Every version gets a real
+> `Migration` **and a migration test that asserts the bin survives**.
+
+and, under how to verify a change:
+
+```powershell
+.\gradlew.bat :app:connectedAndroidTest    # Room migrations, needs a device
+```
+
+There was no `app/src/androidTest` directory. Not an empty one — none. The
+migration tests promised by the standard had never been written, and the command
+documented as proving them printed:
+
+```
+> Task :app:connectedDebugAndroidTest
+BUILD SUCCESSFUL in 4s
+```
+
+No warning, no `NO-SOURCE`, no result file. Two sibling repos by the same author
+were checked the same way and were in the same state.
+
+**Gradle protects the wrong case.** Verified on AGP 8.7.2 / Gradle 9.3.0:
+
+| Situation | Result |
+|---|---|
+| Class filter names a class that doesn't exist | **exit 1** — `Failed loading specified test class 'X'` |
+| `androidTest` source set absent entirely | **exit 0**, `BUILD SUCCESSFUL`, no result XML written |
+
+So a *typo in a filter* fails loudly, while *having no tests at all* passes
+silently. Exactly inverted from which one you would notice unaided.
+
+The failure is not that tests broke. It is that a line in a standards document
+("every version gets a migration test") was believed for the whole life of the
+repo because the command that was supposed to enforce it always agreed.
+
+## The guard
+
+Do not read the exit code. Read the count.
+
+A real run writes `app/build/outputs/androidTest-results/connected/**/TEST-*.xml`
+whose root carries `tests=`, `failures=`, `skipped=`. A vacuous run writes
+**nothing at all**, so "no XML" and "zero tests" are the same failure and one
+check covers both.
+
+```powershell
+# Fail unless instrumented tests actually ran.
+$dir = "app/build/outputs/androidTest-results/connected"
+$xml = Get-ChildItem $dir -Recurse -Filter "TEST-*.xml" -ErrorAction SilentlyContinue
+if (-not $xml) { throw "connectedAndroidTest produced no results: no androidTest source set?" }
+$total = ($xml | ForEach-Object { [int]([xml](Get-Content $_.FullName)).testsuite.tests } |
+          Measure-Object -Sum).Sum
+if ($total -lt 1) { throw "connectedAndroidTest ran $total tests" }
+"instrumented tests run: $total"
+```
+
+Wire the same assertion into CI if instrumented tests run there. A device-backed
+job that silently runs nothing costs the minutes and buys none of the confidence.
+
+**Check the count against intent, not just against zero.** Like the Playwright
+case, the partial run — a filter that matches 3 of 13 — still exits 0 and still
+writes a valid XML. Only your harness knows how many were meant to run.
+
+## Running one class
+
+Two things cost real time here and are in no error message.
+
+**`--tests` is not valid for this task.** It is a JVM-test option; the connected
+task rejects it outright:
+
+```
+Problem configuring task :app:connectedDebugAndroidTest from command line.
+> Unknown command-line option '--tests'.
+```
+
+Use the instrumentation runner argument, with the **fully-qualified class name**:
+
+```bash
+./gradlew :app:connectedDebugAndroidTest \
+  -Pandroid.testInstrumentationRunnerArguments.class=com.example.app.DaoArchiveTest
+```
+
+**In PowerShell that argument must be quoted.** Unquoted, PowerShell splits it on
+the dot and Gradle reports a task nobody wrote:
+
+```
+Task '.testInstrumentationRunnerArguments.class=com.example.app.DaoArchiveTest'
+not found in root project 'X' and its subprojects.
+```
+
+Nothing in that message mentions quoting, `-P`, or PowerShell, and the obvious
+reading — that the task name is wrong — sends you to the wrong file.
+
+```powershell
+# Right: the whole -P argument is one quoted token.
+.\gradlew.bat :app:connectedDebugAndroidTest `
+  "-Pandroid.testInstrumentationRunnerArguments.class=com.example.app.DaoArchiveTest"
+```
+
+**The filter takes a class name, not a filename.** A file named `DatabaseTest.kt`
+routinely declares `DaoArchiveTest` and `MigrationTest` and no class called
+`DatabaseTest`; filtering on the filename yields `Failed loading specified test
+class`. Read the `class` declarations, not the directory listing.
+
+## Verify
+
+- Delete or rename `src/androidTest` and confirm your guard fails. If the build
+  still reports success, the guard is not wired in.
+- After a real run, open the XML and confirm the specific test you just wrote is
+  listed by name. A count alone cannot tell you *which* tests ran, and a new test
+  that silently failed to register is the case you are guarding against.

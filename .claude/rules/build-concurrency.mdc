@@ -1,0 +1,151 @@
+---
+description: At most one build may run at a time per repo (its worktrees share the limit), parallel agents included. Count running builds for the repo before starting one, and wait rather than exceed it.
+globs: **/*
+alwaysApply: true
+---
+
+<!--
+Author: Pandiyaraj Karuppasamy
+Date: Sep-26-2026
+Modified: Oct-02-2026
+Modified: Nov-14-2026 (shared Gradle daemons: no --stop, --no-daemon in parallel work)
+-->
+
+# Build Concurrency
+
+**No more than one build runs for a given repo at the same time**, counted across every
+session, every worktree of that repo, and every agent. A worktree is the same repo: it shares
+the `.git` directory, builds against the same source history, and the same daemon-contention and
+output-corruption risks described below apply to it exactly as they do to the main checkout.
+Two different repos building at once is fine; the limit is per repo, not machine-wide.
+
+## What counts as a build
+
+Anything that compiles, packages or runs a build tool's test task:
+
+- `gradlew` / `gradle` (assemble, test, install scripts that build)
+- `mvn` package, install, verify, test, compile
+- `dotnet build`, `dotnet publish`, `dotnet test`, `msbuild`
+- `npm` / `yarn` / `pnpm run build`, `cargo build`, `cargo test`
+
+An idle Gradle or Kotlin daemon is **not** a build; it is a process waiting for one. A running
+`gradlew` keeps a small wrapper client JVM alive for exactly as long as its build runs,
+so that client is what gets counted. Current wrappers start it as
+`java -jar ...\gradle\wrapper\gradle-wrapper.jar`, older ones by the `GradleWrapperMain` class name,
+so the check matches both. The first version matched only the class name and counted **zero**
+while a build was plainly running: always test the check against a build you know is live.
+
+**A shell running the count-and-wait loop below is not a build either, and must never match
+the pattern.** The first version of this rule's check counted anything with a matching command
+line, with no name filter. An agent waiting for its turn ran the loop in a `bash.exe` subshell;
+nothing distinguished that subshell's own command line from a real build in the process list it
+was reading, and on at least one run two such wait-loop shells were found still sitting there
+after their condition had already been satisfied. Exclude shell process names explicitly
+(`bash.exe`, `sh.exe`, `powershell.exe`, `pwsh.exe`, `cmd.exe`, `conhost.exe`) rather than relying
+on the command-line pattern alone to miss them.
+
+## Before starting a build
+
+Count the builds already running **for this repo**, including its worktrees:
+
+```powershell
+$shells = 'bash.exe', 'sh.exe', 'powershell.exe', 'pwsh.exe', 'cmd.exe', 'conhost.exe'
+$pattern = 'gradle-wrapper\.jar|GradleWrapperMain|org\.gradle\.launcher\.GradleMain|' +
+    '\bmvn(\.cmd)?"?\s.*\b(package|install|verify|test|compile)\b|' +
+    'dotnet(\.exe)?"?\s+(build|publish|test)\b|\bmsbuild(\.exe)?\b|' +
+    '\b(npm|yarn|pnpm)(\.cmd)?"?\s+run\s+build\b|cargo(\.exe)?"?\s+(build|test)\b'
+$builds = @(Get-CimInstance Win32_Process | Where-Object {
+    $_.CommandLine -and $_.Name -notin $shells -and $_.CommandLine -match $pattern })
+
+# Scope to this repo: its shared .git directory is the same for every worktree of it.
+$mine = (git rev-parse --path-format=absolute --git-common-dir 2>$null) -replace '\\', '/'
+$inRepo = @($builds | Where-Object {
+    if ($_.CommandLine -match '-jar\s+"?([^"]+?)[\\/]gradle[\\/]wrapper[\\/]gradle-wrapper\.jar') {
+        $root = $Matches[1]
+        ((git -C $root rev-parse --path-format=absolute --git-common-dir 2>$null) -replace '\\', '/') -eq $mine
+    } else { $false }
+})
+$inRepo.Count
+```
+
+The Gradle case is shown; the same `git -C <root> rev-parse --git-common-dir` scoping applies to
+a Maven, dotnet, npm or cargo invocation by substituting that tool's own way of naming its
+project root from its command line (working directory, `-p`/`--project` flag, or similar).
+
+- **0:** start the build.
+- **1 or more:** do not start. Wait, checking again every minute or so, and say that you are
+  waiting and why. **Never stop another session's build to make room.** It is somebody's
+  work, and a killed build can leave a corrupted cache or a half-written output that the next
+  build trusts.
+
+## Parallel agents
+
+Launching several agents on the same repo is fine; letting more than one of them build at once
+is not.
+
+- **At most one agent builds this repo at a time.** Tell every other agent in its prompt to
+  write code and run pure checks only (for example a Python `--selftest`), and to leave building
+  to whichever agent currently holds the slot.
+- Build and test worktree branches one after another, not concurrently, even though each sits in
+  its own directory: they still share the repo's daemons, disk cache and the device the result
+  gets installed on.
+- The main session's own builds of this repo count towards the limit.
+- Agents on **different** repos may each build at the same time; the limit does not stack across
+  repos.
+- A single repo may set a stricter limit in its own `CLAUDE.md` or memory. The stricter limit
+  wins.
+
+## Gradle daemons are shared: no `--stop`, and `--no-daemon` while agents run
+
+A Gradle daemon belongs to the machine user and the Gradle version, not to a checkout. Every
+worktree of a repo, and every other repo on the same wrapper version, uses the same daemon
+registry under `GRADLE_USER_HOME`, and `gradlew --stop` stops every daemon of that version,
+whichever directory started it (details in `jvm-daemon-cleanup`). So a `--stop` in one worktree
+kills a build running in another, and the per-repo slot above does not protect it.
+
+Seen Nov-14-2026 building Helm (`D:\GitHub\mobile-ai`) with parallel workflow agents, each in its
+own worktree: one agent ran `gradlew --stop`, and another agent's build died with
+`Gradle build daemon has been stopped: stop command received`.
+
+While more than one agent or session may be building on the machine:
+
+- **Never run `gradlew --stop`**, and never kill `java` processes, from an agent. Say so in every
+  agent's brief.
+- **Build with a single-use daemon and capped resources:**
+
+  ```powershell
+  .\gradlew.bat --no-daemon --max-workers=2 "-Dorg.gradle.jvmargs=-Xmx1536m" <tasks>
+  ```
+
+  `--no-daemon` gives the build its own JVM that no other build can stop or wedge. The worker
+  and heap caps keep overlapping builds (other repos, or more than one per repo when the user
+  has explicitly allowed it) inside the machine's memory. Keep the `-D` argument quoted in
+  PowerShell, or it is split at the `=`.
+- **Size the overlap to the machine.** The Helm machine (8 CPUs, 16 GB RAM) carried three
+  Android builds at once with these flags. Treat three as the ceiling for a machine that size,
+  not as a target.
+
+## Why
+
+On Sep-26-2026, three worktree agents and the main session all built the same Android repo at
+once:
+
+- A release build **failed outright**. The install script then put the previous APK on the
+  phone, so a device test measured old code and reported a fix as not working.
+- Builds that normally take two minutes took **6 to 14**.
+- One Gradle daemon and one Kotlin daemon held **about 4.5 GB** between them.
+
+The user stopped every build and set a two-builds-machine-wide limit. On Oct-02-2026, a six-group
+worktree Workflow against the same repo exposed the next problem with that version of the rule:
+the machine-wide count had no concept of "repo" at all, so an agent whose own repo's slot was
+free could still be blocked by an unrelated build in a different repo, and a wait-loop shell
+polling the check could itself get miscounted as a build (see above), leaving the agent stuck
+waiting on a condition that was already true. The rule moved to one build per repo, counted
+across that repo's worktrees, with shells excluded from the process match by name rather than by
+pattern alone. Builds on one machine still compete for CPU, memory, disk and daemon locks; a
+repo-scoped limit keeps that competition to builds that actually share a cache and a device,
+instead of throttling unrelated work for no reason.
+
+See also the `jvm-daemon-cleanup` skill for reclaiming memory from idle daemons, and for telling
+an idle daemon apart from a live build, and the `agent-orchestration-fit` skill for creating
+worktrees for parallel agents.

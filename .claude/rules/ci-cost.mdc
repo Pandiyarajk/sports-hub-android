@@ -1,0 +1,143 @@
+---
+description: Keep an Android repo's CI cheap — run unit tests, don't package an APK nobody downloads, and know exactly which coverage that gives up. Request when adding or reviewing a GitHub Actions workflow for an Android project, or when Actions usage needs cutting.
+globs: .github/workflows/*.yml, .github/workflows/*.yaml
+alwaysApply: false
+---
+
+# Android CI cost
+
+Sibling of [android-app](android-app.mdc) and [release-build](release-build.mdc).
+On-device install and verification is the
+[android-deploy](../../skills/android-deploy/SKILL.md) skill.
+
+An Android build is slow, and packaging is the slow half. A workflow that runs
+`assembleDebug` on every push spends the account's Actions allowance producing an
+artifact that, in practice, nobody downloads — the APK that gets installed is
+almost always the one built locally and pushed over adb.
+
+## Don't package an APK in CI unless something consumes it
+
+```yaml
+# Wrong when nothing downloads the artifact: pays for DEX + packaging on every push.
+- run: ./gradlew testDebugUnitTest --no-daemon
+- run: ./gradlew assembleDebug --no-daemon
+- uses: actions/upload-artifact@v4
+  with: { name: debug-apk, path: app/build/outputs/apk/debug/*.apk }
+```
+
+```yaml
+# Right for a team that installs from a local build.
+- run: ./gradlew testDebugUnitTest --no-daemon
+- uses: actions/upload-artifact@v4        # only on failure, and only the report
+  if: failure()
+  with: { name: unit-test-report, path: app/build/reports/tests/ }
+```
+
+Keep the packaging step only where it earns its cost: a tag/release workflow, a
+distribution channel (Firebase App Distribution, Play internal track), or a QA
+team that genuinely pulls the artifact. Then run it on `push: tags` or
+`workflow_dispatch`, not on every commit.
+
+## You lose less than it looks — but know precisely what
+
+Dropping `assembleDebug` does **not** stop CI from catching a broken build,
+because the test task already depends on most of the pipeline.
+
+Verified with `gradlew testDebugUnitTest --dry-run` on an AGP 8.7.2 project — the
+task graph includes:
+
+```
+:app:processDebugMainManifest
+:app:processDebugManifestForPackage
+:app:processDebugResources
+:app:mergeDebugResources
+:app:compileDebugKotlin
+```
+
+and contains **no** `dexBuilderDebug`, `packageDebug` or `assembleDebug`.
+
+So a Kotlin compile error, a malformed `AndroidManifest.xml` and a missing or
+misnamed resource all still fail CI. What is no longer exercised:
+
+- **DEX** — desugaring, and the 64K method limit
+- **Packaging and signing** — anything that only shows up in an assembled APK
+- **R8** — already release-only, and the failures it causes are silent rather
+  than loud, so CI was never the place they surfaced. See
+  [release-build](release-build.mdc).
+
+Say this in a comment in the workflow. A future reader who sees tests but no
+build will otherwise "fix" it by adding `assembleDebug` back.
+
+## Cheap wins that don't cost coverage
+
+- **Fail fast on the cheapest signal.** Unit tests before anything that packages.
+- **Upload artifacts on `if: failure()` only.** A test report on every green run
+  is storage and minutes for something nobody opens.
+- **Don't pin a Gradle version in the action** — let the wrapper decide, so CI
+  and local builds cannot drift onto different Gradle versions and re-download a
+  second distribution.
+- **One JDK, matching the project.** AGP 8.x wants JDK 17–21; setting a newer one
+  costs a download and then fails (see below).
+- Reserve matrix builds for something that genuinely varies by axis. An Android
+  unit-test suite rarely does.
+
+## AGP and the JDK: the error is a bare version number
+
+Worth pinning in CI *and* documenting for local builds. AGP 8.7.x runs on JDK
+17–21. Given a newer JDK, Gradle refuses with no explanation beyond the version
+it found:
+
+```
+FAILURE: Build failed with an exception.
+* What went wrong:
+25.0.2
+```
+
+Observed with Gradle 8.13 under the JDK 25 that Android Studio was shipping as
+its bundled JBR. Nothing in that message says "unsupported Java version", so it
+reads as a corrupt install.
+
+`actions/setup-java` makes this a non-issue in CI, which is exactly why it bites
+locally instead — a repo whose CI is green can still be unbuildable on a fresh
+machine. Name the required JDK in the repo's `CLAUDE.md`/README rather than
+leaving the next person to decode a version number, and do not assume the
+bundled JBR is a usable JDK.
+
+### The fix: `org.gradle.java.home`, not a different `JAVA_HOME`
+
+Naming the JDK is not enough when `JAVA_HOME` points at the JBR and you cannot
+change it (another tool on the machine needs it). Gradle's launcher can stay on
+the newer JDK while the daemon, which does the compiling, runs on a supported
+one. Verified Oct-19-2026 on a copy of a real project (AGP 8.7, Gradle 8.13,
+`JAVA_HOME` = Android Studio's JBR, JDK 25.0.3):
+
+| Run | Result |
+|---|---|
+| no `org.gradle.java.home` | `BUILD FAILED in 10s`, message is just `25.0.3` |
+| `org.gradle.java.home=<JDK 17 path>` | `BUILD SUCCESSFUL in 20s` |
+
+The stack trace shows where it dies: `JavaVersion.parse` called from
+`compileKotlinScriptToDirectory`, which is Gradle's own embedded build-script
+compiler, not your code and not AGP. That is why it fails before any task runs.
+
+Put the property in the **per-user** `~/.gradle/gradle.properties`, not the
+project's, because the JDK path is machine-specific and a committed path breaks
+every other machine and CI. Confirm which JVM does what:
+
+```
+gradlew --version | findstr "JVM"
+Launcher JVM:  25.0.3
+Daemon JVM:    C:\Program Files\Microsoft\jdk-17...  (from org.gradle.java.home)
+```
+
+Not verified here, so do not rely on them: Gradle toolchain resolution as an
+alternative, and the daemon-reuse criteria when the two JDKs differ.
+
+## Verify
+- [ ] No `assembleDebug`/`assembleRelease` on the default push path unless an
+      artifact is actually consumed.
+- [ ] Artifact uploads are gated on `if: failure()`, or justified.
+- [ ] A comment in the workflow says which coverage the missing package step
+      gives up, so it is not "fixed" back in.
+- [ ] The JDK version in CI matches what the AGP version supports, and the
+      requirement is written down for local builds too.

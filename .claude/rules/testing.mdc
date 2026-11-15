@@ -1,0 +1,756 @@
+---
+description: Test standards : isolating tests from production state files, handling import-time side effects and global state, coverage gates that actually ratchet, and the shapes of test that pass while proving nothing (rebuilt configuration, a constant declared twice so the test measures the copy production never draws, a threshold set from the measured value, a timing bound with no headroom that fails on a busy machine, assertions true of any input, stubs that encode your own assumption, a fixture the domain itself would reject, and a task the build reported UP-TO-DATE without running), and parsed data that balances row by row but was never compared with an independent source. Also: when a target is unreachable by the chosen mechanism, change the mechanism rather than the number.
+globs: **/test_*.py, **/tests/**/*.py, **/conftest.py, **/*Test.kt, **/src/test/**/*.kt
+alwaysApply: false
+---
+
+<!--
+Modified: Nov-15-2026 (added "A unit test must not depend on the machine it runs on")
+-->
+
+# Testing (core)
+
+The rules below are about the things that most often make a suite *lie*: touching
+real state, a coverage number that doesn't mean what it looks like, and a test
+that passes without exercising what it claims to.
+
+Most examples are Python, and the isolation/fixture sections assume pytest. The
+three sections on tests that prove nothing are language-neutral; the
+[rebuilt-configuration one](#a-test-that-rebuilds-production-configuration-proves-nothing)
+has Kotlin evidence.
+
+## Never touch production state
+
+A test run must not read, write, or delete a real database, cache file, log or
+export. Point every state path at `tmp_path` and prove it.
+
+- **Prove it, don't assume it.** For a state file that already exists in the
+  repo, checksum it before and after the suite:
+  ```bash
+  md5sum reviews.db && pytest -q && md5sum reviews.db
+  ```
+  If the digest moved, isolation is broken no matter how the fixtures read.
+- **Monkeypatch the resolver, not the value**, when a module computes a path
+  at call time with no override hook:
+  ```python
+  # _cache_path() rebuilds <repo>/data/cache.json on every call, so patching a
+  # module-level constant achieves nothing.
+  monkeypatch.setattr(mod, "_cache_path", lambda: str(tmp_path / "cache.json"))
+  ```
+- Add the override hook (env var / settings field) when you own the module —
+  patching a private function is a workaround, not a design.
+
+## Import-time side effects change how you must test
+
+If a module runs work at **import** time (an app factory that calls
+`db_init()`, a module-level `app = create_app()`, a connection opened at
+import), then patching afterwards is already too late — the side effect fired
+on first import, against the real path.
+
+Defer the import into the test, after the patch:
+
+```python
+def test_app_factory(monkeypatch, tmp_path):
+    monkeypatch.setattr(db_module, "DB_PATH", str(tmp_path / "t.db"))
+    from server.app import create_app          # deferred: import AFTER the patch
+    create_app()
+```
+
+Document this in the test module's docstring — it looks like a stylistic
+import placement and will otherwise be "tidied" to the top of the file,
+silently reintroducing the problem.
+
+Better still: don't do work at import time. Keep module import side-effect
+free and make the caller invoke the factory.
+
+## A `from x import y` binding defeats patching the source module
+
+Different failure from the section above, and the fix above does **not** solve
+it. There the problem was work firing at import; here the import succeeds
+harmlessly but *captures the object*, so a later patch of the source module
+never reaches the consumer.
+
+```python
+# pkg/consumer.py
+from .source import get_value      # binds the function object, now
+
+def run():
+    return get_value()             # calls the object bound at import time
+```
+
+```python
+monkeypatch.setattr(pkg.source, "get_value", fake)   # patches pkg.source
+pkg.consumer.run()                                   # still calls the REAL one
+```
+
+Verified — a two-module reproduction:
+
+```console
+patching pkg.source.get_value ...
+ module using `from .source import get_value` -> REAL
+ module importing inside the function        -> FAKE
+```
+
+**Nothing fails.** The test passes, having exercised production code. In one
+real case a UI test patched the disk inventory and the assertion still passed —
+against the machine's actual hardware, because the UI module had bound
+`list_disks` at import.
+
+Two fixes, in order of preference:
+
+1. **Import inside the consuming function** so the name is resolved per call.
+   This is the one to reach for when you own the consumer:
+   ```python
+   def run():
+       from .source import get_value   # looked up at call time; patchable
+       return get_value()
+   ```
+   Say why in a comment — it looks like a stylistic import placement and will
+   otherwise be hoisted to the top of the file, silently reintroducing this.
+
+2. **Patch the consumer's namespace instead of the source's** when you cannot
+   change the consumer:
+   ```python
+   monkeypatch.setattr(pkg.consumer, "get_value", fake)
+   ```
+
+Whichever you choose, **assert the patch actually took effect** — the whole
+hazard is that it fails quietly:
+
+```python
+assert table.row_count == 3, "the inventory patch did not reach the UI"
+```
+
+A module-scope `import x` (rather than `from x import y`) is immune: attribute
+lookup happens at call time, so `x.y` sees the patch.
+
+## Reset global state between tests
+
+Module-level mutables and caches leak across tests and make failures depend on
+execution order. Clear them in an `autouse` fixture in `conftest.py`:
+
+```python
+@pytest.fixture(autouse=True)
+def _reset_config_cache():
+    get_config.cache_clear()        # @lru_cache singleton
+    yield
+    get_config.cache_clear()
+```
+
+Typical offenders: `@lru_cache` settings accessors, in-memory registries,
+module-level sessions/clients, scheduler singletons.
+
+## A unit test must not depend on the machine it runs on
+
+A test must not depend on state of the machine it runs on: processes, open
+files, environment variables, the clock, network, installed tools, the user's
+home folder. Such a test passes in CI and fails on the dev PC, or the reverse,
+and the failure looks like a product bug.
+
+Evidence (Helm Core, Nov-15-2026):
+
+- The Agents roster began asking the real process list
+  (`Get-CimInstance Win32_Process -Filter "Name='claude.exe'"`, in
+  `open_sessions.py`) to decide whether a quiet session is still open.
+  `test_live_and_idle_sessions`, `test_finished_session_turn_is_idle` and
+  `test_repos_list_and_filter` write fake transcripts and expect them listed.
+  On the owner's PC two real `claude.exe` sessions were open, the fakes were
+  filtered out and three tests failed on `main` (`KeyError 'c:bbbbbbbb'`).
+- Freshness was read from the file's mtime, so a test that wrote an old
+  timestamp *inside* a just-created file saw it as fresh. The test must
+  `os.utime` the file.
+- Tests put repos two directory levels under the configured root while the
+  code scans direct children only.
+
+**Find offenders:** run the suite on a busy dev PC and on a clean runner and
+compare; grep the code under test for `subprocess`, `psutil`, `os.environ`,
+`Path.home`, `datetime.now`, `time.time`, `shutil.which` and sockets.
+
+**Pattern:** stub at one seam (a function the code calls), with an autouse
+fixture; override per test where the test needs another value; keep one test
+that proves the real call goes through the seam.
+
+```python
+# conftest.py
+@pytest.fixture(autouse=True)
+def _no_real_process_list(monkeypatch):
+    monkeypatch.setattr("pkg.open_session_ids", lambda: frozenset())
+
+# test_a.py
+def test_open_filtered(monkeypatch):            # per-test override
+    monkeypatch.setattr("pkg.open_session_ids", lambda: frozenset({"a"}))
+    assert pkg.visible(["a"]) == []
+
+def test_real_call_made(monkeypatch):           # the seam really runs the tool
+    monkeypatch.undo()                          # drops the autouse stub
+    seen = []
+    monkeypatch.setattr(subprocess, "run",
+        lambda argv, **k: seen.append(argv) or type("R", (), {"stdout": ""})())
+    assert pkg.open_session_ids() == frozenset()
+    assert seen == [["tasklist"]]
+```
+
+Patch the name where the code looks it up (see the import-time section above).
+The snippet was run in a scratch pytest project outside the repo: 3 passed.
+
+## Share fixtures via `conftest.py`
+
+Fixtures copy-pasted across test modules drift. Put `temp_db`, app/client
+factories and the autouse resets in `tests/conftest.py`. A factory *function*
+(not just a fixture) is useful when a test must build the object after
+monkeypatching env the constructor reads.
+
+Enable `--strict-markers`, and `filterwarnings = ["error"]` once the suite is
+warning-clean, so a new deprecation is caught rather than accumulated.
+
+## Coverage gates that actually ratchet
+
+An aggregate `--cov-fail-under` is easy to pass while whole modules sit at
+zero: small, well-tested pure modules carry the average. Real example — a suite
+passed a 45% aggregate gate while its scheduler, app factory and a utility
+module were each at **0%**.
+
+Add a **per-file floor** on top of the aggregate one:
+
+```bash
+pytest --cov=<pkg> --cov-report=json --cov-fail-under=<aggregate>
+python scripts/check_coverage.py coverage.json
+```
+
+See [`templates/common/check_coverage.py`](../../templates/common/check_coverage.py)
+for a ready-to-drop-in script. Seed each threshold slightly below the file's
+current coverage, then raise it as tests are added. Treat a file that vanishes
+from the report as a failure too — it usually means it was renamed or deleted,
+not that it became perfect.
+
+Set thresholds from measured reality, and never lower one to make a build go
+green; if coverage dropped, either add the test or change the threshold
+deliberately, in its own commit, with the reason.
+
+## Test the failure paths
+
+Coverage counts lines, not scenarios. For anything with an exit path other
+than "returned normally", assert the exit path directly: exceptions,
+cancellation, resource cleanup, partial persistence. Generators specifically —
+drive one partway, `.close()` it, and assert what should have been released or
+saved.
+
+## Clean up what the suite spawns
+
+A cleanup handler wrapped in `try/except`/`catch {}` around a **hard-killed**
+child process is not cleanup, it is a comment. Killing a process ungracefully
+skips its own teardown, and the files it still holds open defeat your `rm`,
+which the swallowed exception then hides.
+
+Verified case: a headless-browser harness created its profile with `mkdtemp`
+and removed it in an `exit` handler — correct-looking code that still leaked
+**4 `scoped_dir*` directories plus its profile, ~30 MB, on every single run**,
+because it called `proc.kill()` instead of shutting the browser down first.
+Several hundred runs filled a 251 GB disk and the next unrelated command died
+with `ENOSPC`.
+
+So: ask the child to exit and wait for it before killing; point it at a scratch
+path you own rather than the shared temp dir; and log cleanup failures instead
+of swallowing them. To reclaim a machine that has already accumulated this, use
+the [temp-cleanup](../../skills/temp-cleanup/SKILL.md) skill.
+
+### Make the suite itself fail when anything outlives it
+
+Per-test cleanup is not proof. A session-level gate is: snapshot the processes
+and scratch folders your code creates before the run, compare after, and fail
+the run on any difference, whatever the individual tests said. In `conftest.py`:
+
+```python
+def pytest_sessionstart(session):
+    _BEFORE["procs"], _BEFORE["dirs"] = my_processes(), my_scratch_dirs()
+
+def pytest_sessionfinish(session, exitstatus):
+    leaked = my_processes() - _BEFORE["procs"]          # retry for a few seconds first
+    left = my_scratch_dirs() - _BEFORE["dirs"]
+    if leaked or left:
+        session.exitstatus = pytest.ExitCode.TESTS_FAILED
+```
+
+Match on something your code puts on the child's command line (a unique
+profile or scratch-folder prefix), so another tool's processes are never
+counted. Add a test that hard-kills the parent (`os._exit(0)` in a subprocess)
+and asserts the child tree is gone: that is the only path no `finally` covers.
+The steero driver caught a profile folder left behind by a Firefox shutdown
+race this way, on a run where every test had passed.
+
+## No test may wait forever
+
+A test that waits on a peer (a subprocess, a socket, a browser) with no deadline
+turns one bug into a hung build. Measured Oct-18-2026: an end-to-end test read
+a server's stdout with a bare `readline()`, the server hit an unhandled error
+and never replied, and the suite sat for **148 minutes** with no output and no
+failure. Three layers, all cheap:
+
+- **A per-test timeout for the whole suite**: `pytest-timeout` with
+  `timeout = 300` under `[tool.pytest.ini_options]`, and put it in the dev
+  extra so `pip install -e .[dev]` has it.
+- **A deadline on every read in a test client.** Read in a thread feeding a
+  `queue.Queue` and `get(timeout=...)`, so a missing reply is an assertion
+  failure that names the call, not a hang.
+- **Save the peer's stderr to a file** in the test's `tmp_path`, so the reason
+  is on disk when the deadline fires.
+
+The same applies to the server under test: every request must get an answer,
+including a failure one (a JSON-RPC error, an HTTP 500), or the client above is
+all that stands between you and the hang.
+
+## A test that rebuilds production configuration proves nothing
+
+If a test constructs its own serializer, client or settings object, it verifies
+that *a* configuration works — not the one the application ships. It then stays
+green while production is broken, and it is the test you will point at as
+evidence that the area is covered.
+
+```kotlin
+// Wrong. Proves the fixture can serialize; says nothing about how the app does.
+private val json = Json { encodeDefaults = true }
+
+// Right. The instance every request actually goes through.
+private val json = VwscJson.json
+```
+
+**Verified case.** An app's `Json` did not set `encodeDefaults`, so kotlinx omitted
+every property still at its default and a request object whose fields were all
+defaulted serialized to `{}`. The server bound the missing ints to `0` and
+returned zero rows with a *success* status. The serialization test had passed
+throughout — it built its own `Json { encodeDefaults = true }`. Details in
+[android-app](../android-app/android-app.mdc#kotlinxserialization-drops-defaults-and-the-server-reads-that-as-no-filter).
+
+So:
+
+- **Import the production instance** — the configured singleton, the app factory,
+  the real settings object. If it is awkward to reach from a test, that is a
+  finding about the design, not a reason to rebuild it.
+- **For anything crossing a wire, assert the serialized bytes**, not just that the
+  object round-trips. A peer that coerces a missing field (MVC model binding, most
+  form and query binders) makes a wrong body look like an empty result, so an
+  encode/decode test cannot see the bug at all.
+- **Reproduce against the real peer before fixing.** Sending the broken body and
+  watching it return `0` rows where the corrected one returns `14` is what turns a
+  plausible theory into a diagnosis.
+
+### The same hazard without a rebuilt object: two definitions of the same constant
+
+The section above is about a test that *builds* its own configuration. The
+harder version is a test that imports a real, production-looking constant, just
+not the one production uses. Nothing in the test looks wrong, because nothing in
+it is rebuilt.
+
+**Verified case.** An Android chess app had two sets of board colours:
+`ui.board.BoardThemes`, which the board actually drew from, and
+`ui.theme.BoardPalettes`, which the only contrast test measured. Two agents had
+each defined board colours independently, neither deleted the other's, and both
+compiled. Measured on the drawn set, the last-move highlight came out at
+**1.01:1** against its square, meaning invisible, while a passing accessibility
+test sat in the same repo asserting the palette was fine.
+
+A duplicated constant is invisible to every kind of review that reads one file
+at a time, so look for it by name rather than by reading:
+
+```bash
+# Every declaration of a board colour, not just the one you were about to edit.
+grep -rn "val .*Highlight\|object Board" --include=*.kt src/
+```
+
+So:
+
+- **Name the production path in the test, and assert it is the production path.**
+  If the drawing code reads `BoardThemes.current`, the test measures
+  `BoardThemes.current`, not a palette object that happens to hold similar values.
+- **Before adding a constants object, grep for one.** Two objects holding the
+  same concept is not redundancy, it is a fork: one of them is now wrong and the
+  tests point at the other.
+- **When you find a duplicate, delete it rather than syncing it.** A second copy
+  kept "for the tests" recreates the whole problem on the next edit.
+- **Suspect this specifically after parallel work.** Independent agents or
+  branches touching the same concept produce exactly this shape, and it survives
+  a clean merge.
+
+### A threshold set from the measured value certifies the status quo
+
+A test floor is supposed to encode a standard. Set it from what the code
+currently scores and it encodes the code instead: it can only ever fail if
+something regresses below today, and it will report the current state as
+correct however bad the current state is.
+
+```kotlin
+// Wrong. This can never fail today, and says so out loud.
+private const val MIN_CONTRAST = 1.25   // below the measured worst case (1.32)
+```
+
+**Verified case.** That line was the contrast floor in the chess app above, and
+the comment naming the measured value had itself been written after an earlier
+contrast incident. The threshold was tuned twice to keep the suite green, so the
+suite certified an unreadable board both times.
+
+- **Take the number from the standard, the spec or the requirement**, never from
+  a run. WCAG says 3:1 for non-text contrast; that is the constant.
+- **A comment citing the measured value is the tell.** "just below what we
+  score" means the assertion was written to pass.
+- **If the standard is currently unmet, fail and skip or xfail with a reason and
+  a ticket.** A red test with a link is honest; a green one with a lowered bar is
+  not, and it is the artifact someone will later cite as evidence the area was
+  checked.
+- **Never lower a threshold to make a build go green.** Same rule as the coverage
+  gate above, and it is broken most often by whoever is closest to shipping.
+
+### A timing bound needs headroom, or it measures the machine
+
+The previous section is about a quality floor, which must come from the standard.
+A **wall-clock bound** is different. It is a regression guard, and if it sits at
+the target it fails whenever the machine is busy, not when the code got slower:
+a CI runner, parallel test workers, agents sharing the box, an antivirus scan.
+A flaky timing test teaches people to rerun until green, which then hides the
+real regression.
+
+**Verified case (Oct-25-2026, d:\ppt).** A brief analyser had a 50 ms target on
+200k characters. Its test asserted `best < 0.05` (best of 3 runs). Local runs
+measured 15-45 ms, so the bound was within 10% of the worst observed time,
+while four agents were running pytest on the same machine.
+
+```python
+# Wrong: the target itself is the assertion, about 10% above the worst run.
+assert best < 0.05
+
+# Right: target in the comment, a guard well above it in the assertion.
+analyze(text)                                              # warm-up: imports, caches
+best = min(_timed(analyze, text) for _ in range(3))
+# Target is 50 ms (worst seen ~45 ms); assert 4x so a loaded machine is not a failure.
+assert best < 0.2, f"analyze took {best * 1000:.1f} ms (target 50 ms)"
+```
+
+- **Measure the worst case first**, on the slowest machine that runs the suite,
+  then assert **3-4x** that figure. Keep the real target in a comment or the
+  docstring, where a reviewer still sees it.
+- **Best of N after a warm-up call.** Import time, JIT and first-touch caches
+  are not what the test is about, and a single stall should not decide it.
+- **Put the measured value in the failure message**, so a red run says how far
+  off it was without a rerun.
+- **A real regression is usually 10x, not 10%.** An accidental O(n²) or a
+  network call in a hot path overshoots a 4x guard by a wide margin. The
+  4x guard still catches that, and it does not flag noise.
+- Timing that genuinely matters at a tight margin belongs in a benchmark job
+  with a fixed machine and history, not in the unit suite.
+
+## When the target is unreachable by the mechanism, change the mechanism
+
+A threshold that cannot be met by the approach in front of you is not a tuning
+problem, and raising or lowering the number is the wrong move in both
+directions. Check whether the mechanism can reach it at all before arguing about
+the value.
+
+**Verified case.** In the same app, a translucent overlay marked the last move,
+and it had to read against **both** a light square and a dark one. WCAG 3:1 is
+unreachable that way by construction: any tint dark enough to stand out on the
+light square is close enough to the dark square to disappear there, and the
+reverse. An audit recommended raising the contrast threshold, which nothing
+could have satisfied. The fix was a **second, shape-based signal**: an outline
+around the square, which is visible on either background because it does not
+depend on the tint at all.
+
+- **Ask what value the mechanism can reach at its best**, then compare that to
+  the target before touching the threshold. If the best case fails, the
+  mechanism is the finding.
+- **A single channel carrying a signal over two backgrounds is the classic
+  unreachable case.** Colour alone, opacity alone, brightness alone. Add an
+  orthogonal channel: shape, outline, motion, position, a glyph.
+- **This is also the accessibility answer**, so it is rarely wasted work: a cue
+  that does not depend on colour is the one a colour-blind user gets too.
+- **An audit that recommends a number can still be wrong.** Automated and
+  checklist audits report against a target; they do not check that the target is
+  achievable by the code they are looking at.
+
+## An assertion that is true of any input is not a test
+
+An assertion that cannot fail reads exactly like one that holds. These pass on an
+empty collection, a `None`, or any value at all:
+
+```python
+assert result is not None            # true of 0, "", [], False
+assert len(items) >= 0               # true always
+assert isinstance(out, list)         # true of []
+```
+
+```kotlin
+// Meant to prove every latching command can be released. `releases` is non-empty
+// for any non-empty command list, so the || makes the whole thing tautological.
+assertTrue(command.release != null || releases.isNotEmpty())
+```
+
+**Verified case.** That Kotlin assertion passed while the UI rendered no release
+control at all — a door could be forced with no reachable way to release it. The
+fix was to assert the specific thing: the release is non-null *and* is itself
+present in the offered set.
+
+- **Assert the value, not its shape.** `assertEquals(14, rows.size)` over
+  `assertTrue(rows.isNotEmpty())` wherever the number is knowable.
+- **Prove the test can fail.** Break the production code, or invert the expected
+  value, and confirm it goes red. A test never observed failing is a hypothesis.
+- **Be suspicious of `||` and `or` in an assertion.** Each alternative widens what
+  passes; two loose alternatives usually cover everything.
+- **Guard the mechanism, not just the outcome**, when a setting is load-bearing:
+  `assertEquals("{}", stockJson.encodeToString(…))` records *why* the setting is
+  required, so a later cleanup cannot quietly remove it.
+
+### A regex with alternatives needs one positive case per alternative
+
+The same widening as `||` in an assertion, hidden inside a pattern. A test that
+feeds one matching string proves that *some* branch matches, not that each one
+does.
+
+**Verified case (Oct-14-2026).** A rate-limit detector,
+`rate limit|abuse|secondary|too many requests|\b429\b`, was written to disk
+through a Python patch script run from a shell heredoc, and both `\b` escapes
+landed in the file as literal backspace bytes (0x08). The pattern compiled, and
+its only test, `"fatal: HTTP 429 Too Many Requests"`, passed through the
+`too many requests` branch. The `429` branch could never match:
+`search("error: 429")` returned `False`. An ad hoc check caught it, not the
+suite.
+
+**Where the backslash goes (reproduced Oct-15-2026).** Not in the shell. Even
+`printf '%s' 'x\\ry'`, single-quoted so bash leaves it alone, printed `x\ry`:
+one backslash was already gone before the command reached bash, in the layer
+that hands the command to the shell (an assistant's tool call, a generator, a
+templating step). A Python patch script holding the text in an ordinary string
+then turns the surviving `\r`, `\n` or `\b` into a real carriage return,
+newline or backspace. The same session hit all three: `\b` became 0x08 in a
+regex, `\n` became a newline inside a string literal (a `SyntaxError`, at least
+loud), and `dist\repo-sync.exe` in a PowerShell script became `dist` + CR +
+`epo-sync.exe` (silent until the path is used).
+
+- **One positive string per alternative**, each written so that no other branch
+  can match it, plus a negative string for each branch that is easy to over-match
+  (a bare number inside a SHA or byte count).
+- **After a script writes escape-heavy source** (regex, `\b`, `\t`, Windows
+  paths), check the bytes rather than the rendered view, which hides control
+  characters:
+  ```bash
+  grep -c $'[\x08\x09\x0d]' file.py   # backspace, tab, CR: above 0 is a mangled escape
+  ```
+  A CR check matters most: a carriage return inside a path or string renders
+  as nothing in most viewers. On a CRLF file, compare against `git show
+  HEAD:file` or check only the lines you changed.
+- **Do not route backslashes through a shell-to-Python patch.** Make the edit
+  with a file-edit tool, or build the character explicitly (`chr(92)`), or
+  hold the text in a raw string (`r"""..."""`), which keeps whatever arrives.
+- **Prefer escape-free spellings** where the meaning is equal, for example
+  `(?<![0-9a-f])429(?![0-9a-f])` over `\b429\b`; they survive every quoting
+  layer unchanged.
+
+## A stub that encodes your own assumption proves nothing
+
+When you stub an external tool — a CLI, a device, an HTTP API — the fixture is
+written from your *belief* about what that tool returns. If the belief is wrong,
+the stub and the code agree with each other: the suite is green and production is
+broken. Those tests were never testing the tool. They were testing your parser
+against your own assumption, and the assumption is the thing that failed.
+
+**Verified case.** Code asked an Android device for file sizes, passing the
+format as separate arguments:
+
+```python
+adb.shell("stat", "-c", "%s %n", *paths)     # six unit tests stubbed this
+```
+
+Six tests fed back well-formed `size path` lines; all six passed. The real
+device re-splits the argument string, so it received `stat -c %s %n <paths>`,
+took `%s` alone as the format and `%n` as a *file operand*:
+
+```console
+stat: '%n': No such file or directory
+4732539
+124226339
+```
+
+Bare sizes, no paths. The code matched results **by path**, so every lookup
+missed and every item reported 0 bytes. A user reported it as a UI bug.
+
+The repair that actually closes the hole asserts the **invocation**, not the
+parse:
+
+```python
+command = adb.shell_commands[0]
+self.assertIn("'%s %n'", command)     # the format survived as ONE word
+```
+
+That test fails against the old code. The six parser tests never could — they
+sat downstream of the mistake.
+
+So, for every external tool you stub:
+
+- **Assert the command or request shape, not only the handling of a canned
+  response.** At least one test per stubbed tool should pin the argv, the quoted
+  command string, or the URL/method/body actually sent. A response-parsing test
+  can only ever confirm that your parser agrees with your fixture.
+- **Capture a real response once and use it verbatim.** Run the tool, paste the
+  bytes in, and record the version and the command they came from. A fixture you
+  typed by hand is your assumption restated in a file the suite then trusts.
+- **Keep at least one smoke test against the real tool** where it is reachable,
+  even if CI cannot run it — skip it on absence rather than delete it. State in
+  the test module's docstring which tests are stub-based and which touch the
+  real thing, or the next reader will credit the suite with coverage it lacks.
+- **Let the stub fail the way the tool fails.** A stub may be optimistic about
+  *success* shapes, but it must also be able to emit the failure shapes:
+  malformed output, partial output, an error line interleaved with good lines. A
+  stub that can only produce the happy shape guarantees the parser has never met
+  the output it will meet in production.
+
+## A fixture the domain would reject is not a passing test either
+
+A stub encodes your assumption about an external tool. A **fixture** can encode
+an assumption about the domain itself, and a test built on an impossible input
+proves nothing about a legal one.
+
+**Verified case.** A chess test fixture used the move `a1a8` on a board with
+rooks stacked on `a1` and `a2`. The a-file is blocked, so that move does not
+exist in the game being tested. Five tests built on it had never genuinely
+passed: each one exercised the rejection path while claiming to exercise the
+move.
+
+The general move: **validate a fixture with the same validator production
+uses**, and do it in the suite, not by eye.
+
+```kotlin
+// One test that all the others depend on. Cheap, and it fails loudly.
+@Test fun fixturesAreLegalPositions() =
+    fixtures.forEach { assertTrue(it.move in engine.legalMoves(it.position), "$it") }
+```
+
+This generalises past chess to anything with rules: a schema, a state machine, a
+protocol, a grammar, a physical constraint. If production would refuse the
+input, a test that feeds it in is measuring the refusal.
+
+## A build system can report a test task as passing without running it
+
+Incremental build systems skip a task whose declared inputs have not changed.
+When a test's *real* input arrives outside the build graph, the task goes
+`UP-TO-DATE`, reuses the previous result, and the summary looks identical to a
+genuine run.
+
+**Verified case.** An Android app fetched its Stockfish binary with a script,
+into a path Gradle did not track as an input to the engine test task. Gradle
+reported `UP-TO-DATE` and reused the earlier results, so **9 engine tests kept
+reporting "skipped" as a pass** long after the binary was present and they could
+have run for real.
+
+- **Read the test count and the skip count, not the exit code.** "BUILD
+  SUCCESSFUL" and "0 failures" are both true of a run that executed nothing.
+  Android's version of this is
+  [instrumented-test-discovery](../android-app/instrumented-test-discovery.mdc).
+- **A test that skips on a missing dependency must be counted as not run**, and
+  a suite whose whole point is that dependency should fail when it is absent
+  rather than skip. Skipping is the right default only where the summary is read.
+- **Declare the fetched artifact as a task input**, or fetch it through the build
+  so the graph knows about it. Anything a script drops into the tree is invisible
+  to up-to-date checks.
+- **When in doubt, force it:** rerun with the cache and up-to-date checks off
+  (`--rerun-tasks` for Gradle) and compare the counts. If they differ, every
+  earlier green run was stale.
+
+## Undo a mutation test from a backup, not from git
+
+A mutation test edits the code under test to prove a test fails without it. The undo is
+the dangerous half. `git checkout -- <file>` restores the file to the **last commit**,
+so if the file also held work that was not committed yet, the undo deletes that work
+along with the mutation.
+
+This happened (sftp-pilot, Oct-18-2026): an earlier mutation check ran right after a
+commit, so the checkout was harmless. The next one ran on `sftp_handler.py` while a
+stage of changes was still uncommitted, the checkout restored the old file, and the
+host-key prompt and the folder transfers vanished. It was recoverable only because the
+patches that created them still existed as files.
+
+```powershell
+Copy-Item $file $backup -Force; $hash = (Get-FileHash $file).Hash   # before touching it
+# ... mutate, run the test, expect it to FAIL ...
+Copy-Item $backup $file -Force
+(Get-FileHash $file).Hash -eq $hash                                  # must print True
+```
+
+Commit or stash first when you can; when you cannot, restore from the copy and compare
+the hash. Rerun the test after the restore: it must pass again, or the undo was not exact.
+
+## A test run that hangs: print every thread's stack with `faulthandler_timeout`
+
+When a test suite stalls with no output, do not guess. pytest can dump all thread stacks
+when a test runs longer than N seconds:
+
+```
+python -m pytest -q -o faulthandler_timeout=6 tests/test_x.py
+```
+
+Used Oct-18-2026 on a tkinter suite that hung only after a particular earlier test. The
+dump showed a worker thread inside `paramiko.agent` (an import in progress) with
+`tkinter.Variable.__del__` on top of it: the garbage collector had run on that thread and
+finalised a Tk variable belonging to a window an earlier test had destroyed, which makes a
+Tk call from a non-main thread and blocks. That is not visible from the test code at all.
+See `skills/tkinter-desktop-app` for the fix.
+
+Bisect by order too: the failure needed one specific test to run first. Running pairs
+(`pytest "a::test_one" "b::test_two"`) found it in three runs.
+
+## A parse that balances is not a parse that is right
+
+Row arithmetic (the columns add up to the printed total, valid plus rejected equals polled) proves
+a line was read *consistently*. It does not prove it was read *correctly*: a shifted column, a row
+lost at a page boundary, or a footer digit fused into a vote all leave the line balanced.
+
+Nov-14-2026, a Form-20 PDF parser (234 constituencies, about 70,000 booth rows): nearly every booth
+row passed `sum(candidates) == valid`, yet only 29 of 218 constituencies matched the official
+per-candidate totals from a second source. After the fixes the same measurement read 142, then 194,
+then 223 of 234 exact.
+
+- Find an independent source (an official summary, a published total, a control sheet) and compare
+  per group, not only overall.
+- Report buckets, not a pass rate: exact, within 2 % of the group total, off, unmatched, no data.
+  Measure the error against the **group total**: a 100-vote miss on a 10-vote candidate reads as
+  1000 % per candidate and hides that the group is off by 0.1 %.
+- Save the per-group buckets before a change and compare after. The gate is zero groups moved to a
+  worse bucket. A change that fixes one group and breaks another is the normal failure mode: in this
+  work two constituencies regressed in one round and only the before/after compare showed it.
+- For numbers read by OCR the same applies, harder; see the
+  [scanned-table-ocr](../../skills/scanned-table-ocr/SKILL.md) skill.
+- Groups where the two sources disagree *by their own totals* are findings, not bugs. Two
+  constituencies parsed exactly to the totals printed in their own PDFs, which differed from the
+  official site; no parser change could fix that, and chasing it would have meant guessing votes.
+
+## Verify
+- [ ] No test threshold was set from a measured value; each traces to a standard
+      or a requirement.
+- [ ] Every wall-clock assertion is at least 3x the worst measured time, best of
+      N after a warm-up, with the measured figure in the failure message.
+- [ ] A constant a test asserts about is the single declaration production reads
+      (grepped, not assumed).
+- [ ] Fixtures are validated by production's own validator, so an impossible
+      input cannot masquerade as a passing case.
+- [ ] Test-count and skip-count are read from the report, and a task reported
+      `UP-TO-DATE` is rerun before its result is believed.
+- [ ] Tests use the application's own serializer/client/settings, not a
+      locally-rebuilt equivalent.
+- [ ] Wire-crossing tests assert the serialized payload's keys and values.
+- [ ] No assertion in the suite is true regardless of input; each has been seen
+      to fail at least once.
+- [ ] Each alternative of a tested regex has its own positive case that no other
+      branch can match.
+- [ ] A mutation test is undone from a backup copy with a matching hash, not from
+      `git checkout`.
+- [ ] Every suite that stubs a subprocess, CLI or HTTP peer asserts the argv or
+      command string it sends, not only the canned response it parses back.
+- [ ] Suite leaves every real state file byte-identical (checksum-verified).
+- [ ] Processes the suite spawns are shut down gracefully before being killed,
+      and their scratch directories are gone afterwards.
+- [ ] Modules with import-time side effects are imported *after* their patch,
+      with a docstring saying why.
+- [ ] Global caches/registries are reset by an autouse fixture.
+- [ ] Nothing in a unit test reads real machine state (process list, env, clock, home,
+      network, installed tools): an autouse stub sits at the seam, and one test asserts
+      the real call is made.
+- [ ] Shared fixtures live in `conftest.py`, not duplicated per module.
+- [ ] A per-file coverage floor runs alongside the aggregate gate.
+- [ ] Parsed or converted data is compared per group with an independent source, in buckets, and a
+      change is accepted only when no group moved to a worse bucket.

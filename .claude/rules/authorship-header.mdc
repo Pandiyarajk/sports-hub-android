@@ -1,0 +1,106 @@
+---
+description: Every new file gets an Author/Date header in its docstring; edits update a Modified line. Creation date never changes. Every script file and every function, in any language, carries a doc comment (user rule), with the convention per language.
+globs: **/*
+alwaysApply: true
+---
+
+# Authorship Header
+
+When **creating any new file**, add an author and creation-date header to the
+file's module docstring (or the language's idiomatic top-of-file comment).
+
+- **Author:** `Pandiyaraj Karuppasamy`
+- **Date:** the file's creation date, formatted `<Mon-DD-YYYY>` (three-letter
+  month, e.g. `Jul-18-2026`).
+
+## Python
+
+```python
+"""
+Short one-line description of the module.
+
+Author: Pandiyaraj Karuppasamy
+Date: Jul-18-2026
+"""
+```
+
+If the file already has a multi-line docstring, append `Author:` / `Date:` just
+before the closing `"""`. Expand a single-line docstring into the multi-line
+form.
+
+## Other languages
+
+Use the idiomatic top-of-file comment, keeping the same two fields and format:
+
+```csharp
+// Short description.
+//
+// Author: Pandiyaraj Karuppasamy
+// Date: Jul-18-2026
+```
+
+## Editing an existing file
+
+Add or update a `Modified:` line directly after `Date:`:
+
+```python
+"""
+Short one-line description of the module.
+
+Author: Pandiyaraj Karuppasamy
+Date: Jul-18-2026
+Modified: Aug-02-2026
+"""
+```
+
+- The `Date:` (creation) line **must never change**.
+- If `Modified:` exists, set it to today's date; if absent, add it after `Date:`.
+
+## Every script file and every function is documented, in any language (user rule, Nov-09-2026)
+
+This applies to every script and source file in any language and any app (Python, PowerShell,
+Bash, JavaScript/TypeScript, C#, Kotlin, Java, C/C++, SQL scripts):
+
+- **File:** the top-of-file docstring or comment above, with a one-line description of what the
+  file does, `Author:` and `Date:`. For a runnable script, add a usage line.
+- **Function:** a doc comment directly on every function and method, private helpers included,
+  in the language's own convention: what it does in one line, then parameters, return value and
+  what it throws for anything public.
+- **Files you touch:** when editing a file that lacks either, add them (header first, then the
+  functions you changed, then the rest of the file when it is small).
+
+| Language | Function doc convention |
+|---|---|
+| Python | `"""docstring"""` under the `def`, Google style (`Args:` / `Returns:` / `Raises:`) |
+| PowerShell | comment-based help inside the function: `<# .SYNOPSIS ... .PARAMETER ... #>` |
+| Bash / sh | `# name: what it does` + `# Args: $1 ...` lines directly above the function |
+| JavaScript / TypeScript | JSDoc `/** ... @param ... @returns ... */` |
+| C# | XML doc `/// <summary>`, `<param>`, `<returns>` |
+| Kotlin / Java | KDoc / Javadoc `/** ... @param ... @return ... */` |
+| C / C++ | Doxygen `/** @brief ... @param ... @return ... */` |
+| SQL | `-- Purpose:` / `-- Params:` block above each procedure or function |
+
+```powershell
+<#
+Collects release APKs into D:\GitHub\apk.
+
+Author: Pandiyaraj Karuppasamy
+Date: Nov-09-2026
+Usage: .\collect-apk.ps1 -Repo D:\GitHub\my-app
+#>
+
+function Get-ApkPath {
+    <#
+    .SYNOPSIS
+    Returns the release APK path recorded in output-metadata.json.
+    .PARAMETER Repo
+    Root folder of the Android repo.
+    #>
+    param([string]$Repo)
+    ...
+}
+```
+
+A comment says what and why, not a restatement of the code. `# increment i` on `i += 1` is
+noise; `# retry once: MIUI's first install is often taken by an on-screen prompt` is the kind
+worth writing.
