@@ -2,6 +2,8 @@
 // Date: Oct-17-2026
 // Modified: Oct-17-2026 (detail screens survive process death until their data loads; a tapped
 //   alert opens its match; football match screen; follow bell on a cricket match)
+// Modified: Nov-20-2026 (bars and content keep clear of the camera cutout in landscape; a side
+//   rail replaces the top and bottom bars on a landscape home screen)
 
 @file:OptIn(ExperimentalMaterial3Api::class)
 
@@ -13,8 +15,14 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.WindowInsetsSides
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.only
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
@@ -25,6 +33,8 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
+import androidx.compose.material3.NavigationRail
+import androidx.compose.material3.NavigationRailItem
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -36,6 +46,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -168,9 +179,19 @@ private fun App(vm: SportsViewModel, settings: AppSettings, open: OpenRequest?, 
         screen = if (screen == Screen.ABOUT) Screen.SETTINGS else Screen.HOME
     }
 
+    // Edge to edge (target SDK 35) puts the window under the camera cutout, which sits on a side
+    // in landscape. The Material defaults pad for the system bars only, so a right-hand score
+    // column ran under the cutout and was cut off. safeDrawing covers bars and cutout alike.
+    // A phone on its side is about 400 dp tall: a top bar and a bottom bar together would take
+    // a third of it. The home screen then swaps both for a side rail; detail screens keep their
+    // top bar for the back arrow and title.
+    val railMode = LocalConfiguration.current.screenHeightDp < RAIL_MAX_HEIGHT_DP && screen == Screen.HOME
+
     Scaffold(
+        contentWindowInsets = WindowInsets.safeDrawing,
         topBar = {
-            TopAppBar(
+            if (!railMode) TopAppBar(
+                windowInsets = WindowInsets.safeDrawing.only(WindowInsetsSides.Horizontal + WindowInsetsSides.Top),
                 title = {
                     Text(
                         when (screen) {
@@ -210,8 +231,10 @@ private fun App(vm: SportsViewModel, settings: AppSettings, open: OpenRequest?, 
             )
         },
         bottomBar = {
-            if (screen == Screen.HOME) {
-                NavigationBar {
+            if (screen == Screen.HOME && !railMode) {
+                NavigationBar(
+                    windowInsets = WindowInsets.safeDrawing.only(WindowInsetsSides.Horizontal + WindowInsetsSides.Bottom),
+                ) {
                     SportTab.entries.forEach { t ->
                         NavigationBarItem(
                             selected = tab == t,
@@ -224,8 +247,9 @@ private fun App(vm: SportsViewModel, settings: AppSettings, open: OpenRequest?, 
             }
         },
     ) { padding ->
-        val content = Modifier.padding(padding)
-        androidx.compose.foundation.layout.Box(content) {
+        Row(Modifier.padding(padding)) {
+        if (railMode) HomeRail(tab, onTab = { tab = it }, onSettings = { screen = Screen.SETTINGS })
+        androidx.compose.foundation.layout.Box(Modifier.weight(1f)) {
             when (screen) {
                 Screen.HOME -> when (tab) {
                     SportTab.CRICKET -> CricketScreen(vm, settings) { m ->
@@ -251,5 +275,33 @@ private fun App(vm: SportsViewModel, settings: AppSettings, open: OpenRequest?, 
                 Screen.ABOUT -> AboutScreen()
             }
         }
+        }
+    }
+}
+
+/** Below this screen height (dp) the home screen uses a side rail instead of top and bottom bars. */
+private const val RAIL_MAX_HEIGHT_DP = 480
+
+/**
+ * The home screen's tabs as a slim rail down the side, with Settings at its foot, for short
+ * (landscape) screens. It sits inside the scaffold's padding, so it adds no insets of its own.
+ *
+ * @param tab the tab showing.
+ * @param onTab called with the tapped tab.
+ * @param onSettings called when Settings is tapped.
+ */
+@Composable
+private fun HomeRail(tab: SportTab, onTab: (SportTab) -> Unit, onSettings: () -> Unit) {
+    NavigationRail(windowInsets = WindowInsets(0, 0, 0, 0)) {
+        SportTab.entries.forEach { t ->
+            NavigationRailItem(
+                selected = tab == t,
+                onClick = { onTab(t) },
+                icon = { Text(t.glyph, fontSize = 20.sp) },
+                label = { Text(t.title) },
+            )
+        }
+        Spacer(Modifier.weight(1f))
+        IconButton(onClick = onSettings) { Icon(Icons.Filled.Settings, contentDescription = "Settings") }
     }
 }

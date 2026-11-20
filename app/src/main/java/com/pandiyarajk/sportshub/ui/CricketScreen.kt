@@ -2,21 +2,27 @@
 // Date: Oct-17-2026
 // Modified: Oct-17-2026 (dividers between cards, filter chips, freshness line, even India strip,
 //   alert bell on the India title)
+// Modified: Nov-20-2026 (India strip cards sized from the row's own width, not the screen's;
+//   two tiles a row on wide screens such as a phone in landscape)
 
 package com.pandiyarajk.sportshub.ui
 
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListScope
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -33,7 +39,6 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LocalLifecycleOwner
@@ -89,14 +94,18 @@ fun CricketScreen(vm: SportsViewModel, settings: AppSettings, onOpen: (CricketMa
             val shown = matches.filter(filter.accepts)
             val india = if (filter == CricketFilter.ALL && settings.pinIndia) shown.filter { it.isIndia } else emptyList()
             val rest = shown.filterNot { it in india }
+            // Wide screens (landscape) put two tiles side by side, so a turned phone shows twice
+            // as many matches instead of stretched cards with an empty middle.
+            BoxWithConstraints(Modifier.fillMaxSize()) {
+            val twoUp = maxWidth >= TWO_UP_MIN_WIDTH
             LazyColumn(
                 contentPadding = PaddingValues(16.dp),
                 verticalArrangement = Arrangement.spacedBy(10.dp),
             ) {
                 item(key = "chips") {
-                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    val chips: @Composable (Modifier) -> Unit = { modifier ->
                         Row(
-                            Modifier.horizontalScroll(rememberScrollState()),
+                            modifier.horizontalScroll(rememberScrollState()),
                             horizontalArrangement = Arrangement.spacedBy(8.dp),
                         ) {
                             CricketFilter.entries.forEach { f ->
@@ -108,7 +117,20 @@ fun CricketScreen(vm: SportsViewModel, settings: AppSettings, onOpen: (CricketMa
                                 )
                             }
                         }
-                        FreshnessLine(updatedAt, offline)
+                    }
+                    if (twoUp) {
+                        // Wide screens have room for the freshness line beside the chips, which
+                        // gives a short landscape screen one more line of matches.
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            chips(Modifier.weight(1f, fill = false))
+                            Spacer(Modifier.width(16.dp))
+                            FreshnessLine(updatedAt, offline)
+                        }
+                    } else {
+                        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                            chips(Modifier)
+                            FreshnessLine(updatedAt, offline)
+                        }
                     }
                 }
                 if (shown.isEmpty()) {
@@ -128,7 +150,20 @@ fun CricketScreen(vm: SportsViewModel, settings: AppSettings, onOpen: (CricketMa
                         }
                     }
                     item(key = "india-row") {
-                        if (india.size == 1) {
+                        if (twoUp) {
+                            // Two tiles a view; a third and more scroll in sideways.
+                            BoxWithConstraints(Modifier.fillMaxWidth()) {
+                                val cardWidth = (maxWidth - TILE_GAP) / 2
+                                Row(
+                                    Modifier.horizontalScroll(rememberScrollState()).height(IntrinsicSize.Max),
+                                    horizontalArrangement = Arrangement.spacedBy(TILE_GAP),
+                                ) {
+                                    india.forEach { m ->
+                                        MatchCard(m, Modifier.width(cardWidth).fillMaxHeight(), showLeague = true) { onOpen(m) }
+                                    }
+                                }
+                            }
+                        } else if (india.size == 1) {
                             // One match takes the full width, whatever its state.
                             val m = india.single()
                             MatchCard(m, Modifier.fillMaxWidth(), showLeague = true) { onOpen(m) }
@@ -137,13 +172,17 @@ fun CricketScreen(vm: SportsViewModel, settings: AppSettings, onOpen: (CricketMa
                             // peeks in. A plain Row, not a LazyRow: there are only ever a few, and
                             // IntrinsicSize.Max gives every card the tallest card's height, which
                             // a lazy row cannot measure.
-                            val cardWidth = (LocalConfiguration.current.screenWidthDp - 56).dp
-                            Row(
-                                Modifier.horizontalScroll(rememberScrollState()).height(IntrinsicSize.Max),
-                                horizontalArrangement = Arrangement.spacedBy(10.dp),
-                            ) {
-                                india.forEach { m ->
-                                    MatchCard(m, Modifier.width(cardWidth).fillMaxHeight(), showLeague = true) { onOpen(m) }
+                            // Sized from the width this row really has, not the screen's: in
+                            // landscape the nav bar and camera cutout take a side each.
+                            BoxWithConstraints(Modifier.fillMaxWidth()) {
+                                val cardWidth = maxWidth - 24.dp
+                                Row(
+                                    Modifier.horizontalScroll(rememberScrollState()).height(IntrinsicSize.Max),
+                                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                                ) {
+                                    india.forEach { m ->
+                                        MatchCard(m, Modifier.width(cardWidth).fillMaxHeight(), showLeague = true) { onOpen(m) }
+                                    }
                                 }
                             }
                         }
@@ -152,13 +191,67 @@ fun CricketScreen(vm: SportsViewModel, settings: AppSettings, onOpen: (CricketMa
                 if (filter == CricketFilter.ALL) {
                     rest.groupBy { it.league }.forEach { (league, group) ->
                         item(key = "league-$league") { SectionTitle(league, Modifier.padding(top = 6.dp)) }
-                        items(group, key = { it.id }) { m -> DividedCard(m, showLeague = false, onOpen) }
+                        cardItems(group, twoUp, showLeague = false, onOpen)
                     }
                 } else {
-                    items(rest, key = { it.id }) { m -> DividedCard(m, showLeague = true, onOpen) }
+                    cardItems(rest, twoUp, showLeague = true, onOpen)
                 }
             }
+            }
         }
+    }
+}
+
+/** Screens at least this wide (a phone in landscape, a tablet) show two tiles a row. */
+private val TWO_UP_MIN_WIDTH = 600.dp
+
+/** The gap between two tiles in a row, the same as the gap between rows. */
+private val TILE_GAP = 10.dp
+
+/**
+ * Adds [matches] to the list, one card a row, or two a row when [twoUp] is set.
+ *
+ * @param matches the cards to add, in order.
+ * @param twoUp true to pair them side by side.
+ * @param showLeague true to print each card's series name.
+ * @param onOpen called with the tapped match.
+ */
+private fun LazyListScope.cardItems(
+    matches: List<CricketMatch>,
+    twoUp: Boolean,
+    showLeague: Boolean,
+    onOpen: (CricketMatch) -> Unit,
+) {
+    if (twoUp) {
+        items(matches.chunked(2), key = { pair -> pair.joinToString("+") { it.id } }) { pair ->
+            DividedPair(pair, showLeague, onOpen)
+        }
+    } else {
+        items(matches, key = { it.id }) { m -> DividedCard(m, showLeague = showLeague, onOpen) }
+    }
+}
+
+/**
+ * Two cards side by side, equal width and the taller one's height, with the list's divider
+ * under them. A lone last card keeps half the width so it lines up with the pairs above.
+ *
+ * @param pair one or two matches.
+ * @param showLeague true to print each card's series name.
+ * @param onOpen called with the tapped match.
+ */
+@Composable
+private fun DividedPair(pair: List<CricketMatch>, showLeague: Boolean, onOpen: (CricketMatch) -> Unit) {
+    Column {
+        Row(Modifier.height(IntrinsicSize.Max), horizontalArrangement = Arrangement.spacedBy(TILE_GAP)) {
+            pair.forEach { m ->
+                MatchCard(m, Modifier.weight(1f).fillMaxHeight(), showLeague = showLeague) { onOpen(m) }
+            }
+            if (pair.size == 1) Spacer(Modifier.weight(1f))
+        }
+        HorizontalDivider(
+            Modifier.padding(top = 10.dp),
+            color = MaterialTheme.colorScheme.outlineVariant,
+        )
     }
 }
 

@@ -1,6 +1,8 @@
 // Author: Pandiyaraj Karuppasamy
 // Date: Oct-17-2026
 // Modified: Oct-17-2026 (short club names, freshness line, pull-only spinner, alert bell, live match cards)
+// Modified: Nov-20-2026 (match cards sized from the row's own width, not the screen's; two a
+//   view on wide screens)
 
 package com.pandiyarajk.sportshub.ui
 
@@ -9,6 +11,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.PaddingValues
@@ -38,7 +41,6 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -149,7 +151,6 @@ private fun TableList(
     matches: List<Fixture>,
     onMatch: (Fixture) -> Unit,
 ) {
-    val cardWidth = (LocalConfiguration.current.screenWidthDp - 56).dp
     LazyColumn(contentPadding = PaddingValues(horizontal = 8.dp, vertical = 16.dp)) {
         if (matches.isNotEmpty()) {
             item(key = "matches-title") {
@@ -158,13 +159,20 @@ private fun TableList(
             item(key = "matches") {
                 // A plain scrolling Row, as the India strip: few cards, and every card takes the
                 // tallest one's height, which a lazy row cannot measure.
-                Row(
-                    Modifier.horizontalScroll(rememberScrollState()).height(IntrinsicSize.Max)
-                        .padding(start = 8.dp, end = 8.dp, bottom = 20.dp),
-                    horizontalArrangement = Arrangement.spacedBy(10.dp),
-                ) {
-                    matches.forEach { f ->
-                        FootballMatchCard(f, Modifier.width(cardWidth).fillMaxHeight()) { onMatch(f) }
+                // Sized from the width this row really has, not the screen's: in landscape the
+                // nav bar and camera cutout take a side each.
+                BoxWithConstraints(Modifier.fillMaxWidth()) {
+                    // Wide screens (landscape) show two cards a view; narrow ones one, with the
+                    // next peeking in. The row itself pads 8 dp each side.
+                    val cardWidth = if (maxWidth >= 600.dp) (maxWidth - 16.dp - 10.dp) / 2 else maxWidth - 40.dp
+                    Row(
+                        Modifier.horizontalScroll(rememberScrollState()).height(IntrinsicSize.Max)
+                            .padding(start = 8.dp, end = 8.dp, bottom = 20.dp),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    ) {
+                        matches.forEach { f ->
+                            FootballMatchCard(f, Modifier.width(cardWidth).fillMaxHeight()) { onMatch(f) }
+                        }
                     }
                 }
             }
