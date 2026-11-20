@@ -1,6 +1,7 @@
 // Author: Pandiyaraj Karuppasamy
 // Date: Oct-17-2026
 // Modified: Oct-17-2026 (WorkManager for live alerts; version 0.1.1)
+// Modified: Nov-20-2026 (version 0.1.2: landscape cutout fix)
 
 import java.util.Properties
 
@@ -31,8 +32,8 @@ android {
         applicationId = "com.pandiyarajk.sportshub"
         minSdk = 26
         targetSdk = 35
-        versionCode = 2
-        versionName = "0.1.1"
+        versionCode = 3
+        versionName = "0.1.2"
     }
 
     signingConfigs {
