@@ -21,6 +21,15 @@ internal fun JsonElement?.list(): List<JsonElement> = (this as? JsonArray) ?: em
 internal fun JsonElement?.text(): String =
     (this as? JsonPrimitive)?.takeIf { it !is JsonNull }?.content.orEmpty()
 
+/**
+ * ESPN writes a wicket-keeper's dagger in dismissal text as an HTML entity ("c &dagger;Pant b
+ * Bumrah"). Turned into the characters before parsing, so every parser sees "c †Pant b Bumrah".
+ * `&quot;` is left alone: inside a JSON string it would break the document.
+ */
+internal fun decodeEntities(body: String): String =
+    if ('&' !in body) body
+    else body.replace("&dagger;", "†").replace("&Dagger;", "‡").replace("&amp;", "&").replace("&#39;", "'").replace("&apos;", "'")
+
 /** ESPN sends counts as floats (6.0) in some places and strings or ints (6) in others. */
 internal fun JsonElement?.int(): Int = text().let { it.toIntOrNull() ?: it.toDoubleOrNull()?.toInt() } ?: 0
 

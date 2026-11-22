@@ -1,5 +1,11 @@
 // Author: Pandiyaraj Karuppasamy
 // Date: Oct-17-2026
+// Modified: Nov-22-2026 (last bat and fall of wicket)
+// Modified: Nov-22-2026 (player styles)
+// Modified: Nov-22-2026 (full dismissal from outDetails.shortText)
+// Modified: Nov-22-2026 (decode &dagger; in dismissals)
+// Modified: Nov-22-2026 (min overs remaining)
+// Modified: Nov-22-2026 (current partnership and reviews left)
 // Modified: Nov-22-2026 (parse the Test day and session; teams ordered by the feed's order, batting first on top)
 // Modified: Oct-17-2026 (match label, city and winner; skip matches with no id;
 //   scorecard falls back to per-player roster stats when matchcards is empty; a rain delay or
@@ -9,6 +15,7 @@ package com.pandiyarajk.sportshub.data.cricket
 
 import com.pandiyarajk.sportshub.data.Http
 import com.pandiyarajk.sportshub.data.at
+import com.pandiyarajk.sportshub.data.decodeEntities
 import com.pandiyarajk.sportshub.data.int
 import com.pandiyarajk.sportshub.data.list
 import com.pandiyarajk.sportshub.data.text
@@ -98,7 +105,7 @@ fun parseCricketHeader(body: String): List<CricketMatch> {
  * same figures sit per player under `rosters`; the rosters are the fallback.
  */
 fun parseScorecard(body: String, known: Map<String, String> = emptyMap()): Scorecard {
-    val root = Http.json.parseToJsonElement(body)
+    val root = Http.json.parseToJsonElement(decodeEntities(body))
     val fromCards = parseMatchcards(root)
     val fromRosters = parseRosterInnings(root)
     val dismissals = known + runCatching { wicketBalls(root).associate { it.batter to it.how } }.getOrDefault(emptyMap())
@@ -109,13 +116,52 @@ fun parseScorecard(body: String, known: Map<String, String> = emptyMap()): Score
     val innings = byNumber.toSortedMap().values.map { inn ->
         inn.copy(batting = inn.batting.map { r -> r.copy(dismissal = fullDismissal(r.name, r.dismissal, dismissals)) })
     }
+    // Batting hand and bowling style come from the rosters' athlete data, matched by name.
+    val styles = playerStyles(root)
+    val styled = innings.map { inn ->
+        inn.copy(
+            batting = inn.batting.map { r -> r.copy(style = styles[r.name]?.first.orEmpty()) },
+            bowling = inn.bowling.map { r -> r.copy(style = styles[r.name]?.second.orEmpty()) },
+        )
+    }
     // The live panel is extra: a failure to read it must never cost the scorecard.
-    val live = runCatching { parseLivePanel(root)?.let { reconcile(it, innings) } }.getOrNull()
+    val live = runCatching {
+        parseLivePanel(root)?.let { reconcile(it, styled) }?.let { p ->
+            p.copy(
+                batters = p.batters.map { b -> b.copy(style = styles[b.name]?.first.orEmpty()) },
+                bowlers = p.bowlers.map { w -> w.copy(style = styles[w.name]?.second.orEmpty()) },
+                // The scorecard's own row has his full figures, which a stand's figures may not.
+                lastBat = styled.lastOrNull()?.batting?.firstOrNull { it.name == p.lastBatName }
+                    ?.let { "${it.name} ${it.runs} (${it.balls}b)" } ?: p.lastBat,
+            )
+        }
+    }.getOrNull()
     // Out, but only the code is known: the repository looks these up in the play-by-play.
-    val unresolved = innings.flatMap { it.batting }
-        .filter { r -> !r.dismissal.equals("not out", ignoreCase = true) && r.dismissal.isNotBlank() && r.name !in dismissals }
+    val unresolved = styled.flatMap { it.batting }
+        .filter { r -> !r.dismissal.equals("not out", ignoreCase = true) && r.dismissal.isNotBlank() && r.name !in dismissals && !isFullDismissal(r.dismissal) }
         .map { it.name }.toSet()
-    return Scorecard(innings, live, dismissals, unresolved)
+    return Scorecard(styled, live, dismissals, unresolved)
+}
+
+/**
+ * Batting hand and bowling style per player, lowercase as Cricinfo shows them ("lhb", "rmf"), from
+ * rosters[].roster[].athlete.style. Keyed by display name and by the scorecard's initials name.
+ */
+internal fun playerStyles(root: JsonElement): Map<String, Pair<String, String>> {
+    val out = mutableMapOf<String, Pair<String, String>>()
+    root.at("rosters").list().forEach { side ->
+        side.at("roster").list().forEach { player ->
+            val a = player.at("athlete")
+            val styles = a.at("style").list()
+            fun pick(type: String) = styles.firstOrNull { it.at("type").text() == type }
+                .at("shortDescription").text().lowercase()
+            val pair = pick("batting") to pick("bowling")
+            if (pair.first.isEmpty() && pair.second.isEmpty()) return@forEach
+            listOf("displayName", "battingName", "fullName").map { a.at(it).text() }.filter { it.isNotBlank() }
+                .forEach { out.putIfAbsent(it, pair) }
+        }
+    }
+    return out
 }
 
 /** One wicket from the ball-by-ball: who, how ("c Joseph b Paul") and the full line. */
@@ -188,7 +234,7 @@ fun wicketBalls(root: JsonElement): List<WicketBall> =
  * so a wicket from the first over still reads "c Joseph b Paul" an hour later.
  */
 fun parsePlayByPlayPage(body: String): Pair<List<WicketBall>, Int> {
-    val c = Http.json.parseToJsonElement(body).at("commentary")
+    val c = Http.json.parseToJsonElement(decodeEntities(body)).at("commentary")
     return wicketBallsIn(c.at("items").list()) to c.at("pageCount").int()
 }
 
@@ -218,7 +264,7 @@ private fun wicketBallsIn(balls: Collection<JsonElement>): List<WicketBall> {
     }.sortedBy { it.sequence }
 }
 
-fun wicketBalls(body: String): List<WicketBall> = wicketBalls(Http.json.parseToJsonElement(body))
+fun wicketBalls(body: String): List<WicketBall> = wicketBalls(Http.json.parseToJsonElement(decodeEntities(body)))
 
 /**
  * Where a dismissal begins inside "SV Samson b Springer": a lowercase keyword after a space.
@@ -234,9 +280,16 @@ private val DISMISSAL_CODES = mapOf(
     "run out" to "run out", "hw" to "hit wicket", "ct" to "caught",
 )
 
+/** True for a complete dismissal such as "c Smith b Ravindra", "b Smith", "c & b Paul" or "lbw b Henry". */
+internal fun isFullDismissal(text: String): Boolean = FULL_DISMISSAL.containsMatchIn(text.trim())
+
+private val FULL_DISMISSAL = Regex("""^(c\s.+\sb\s|c\s*&\s*b\s|st\s.+\sb\s|lbw\s+b\s|hit wicket\s+b\s|b\s+\S|run out)""", RegexOption.IGNORE_CASE)
+
 /** The full "c Joseph b Paul" when known; else the code in words; else as given. */
 internal fun fullDismissal(name: String, given: String, known: Map<String, String>): String {
     if (given.equals("not out", ignoreCase = true)) return given
+    // Already the whole text ("c Smith b Ravindra"): the feed's own words beat anything pieced together.
+    if (isFullDismissal(given)) return given.trim()
     known[name]?.let { return it }
     return DISMISSAL_CODES[given.trim().lowercase()] ?: given
 }
@@ -360,8 +413,61 @@ private fun parseLivePanel(root: JsonElement): LivePanel? {
         recent = recent,
         recentOvers = recentOvers,
         thisOver = thisOver,
+        partnership = currentPartnership(line),
+        lastBat = lastWicket(line)?.let { "${it.name} ${it.runs} (${it.balls}b)" }.orEmpty(),
+        lastBatName = lastWicket(line)?.name.orEmpty(),
+        fow = lastWicket(line)?.fow.orEmpty(),
+        reviews = reviewsLeft(comp),
+        minOversLeft = minOversLeft(comp.at("limitedOvers").text() == "false", st["remainingOvers"].orEmpty()),
     )
 }
+
+/**
+ * The unbroken pair at the crease: the last entry of the batting line's `partnerships`, unless it
+ * ended in a wicket (then the next pair has not faced a ball). Balls are the two batters' own.
+ */
+internal fun currentPartnership(line: JsonElement?): Partnership? {
+    val last = line.at("partnerships").list().lastOrNull() ?: return null
+    if (last.at("fowType").text() == "out") return null
+    val balls = last.at("batsmen").list().sumOf { it.at("balls").int() }
+    return Partnership(last.at("runs").int(), balls, last.at("overs").text(), last.at("runRate").text())
+}
+
+/** Cricinfo's "Min. Ov. Rem": only a Test has it, and 0 or blank means the day is over or unknown. */
+internal fun minOversLeft(isTest: Boolean, remaining: String): String =
+    remaining.takeIf { isTest && (it.toDoubleOrNull() ?: 0.0) > 0.0 }.orEmpty()
+
+/** Who fell last and where: the dismissed batter of the previous stand and its fall of wicket. */
+internal data class LastWicket(val name: String, val runs: Int, val balls: Int, val fow: String)
+
+/**
+ * The stand before the unbroken one ended in a wicket: its batter who is not in the current pair
+ * is the one out, and its `end` gives the fall of wicket ("0/1 (0.2 Ov)"). Null when the current
+ * stand is the first, or when a wicket has just fallen and no new pair is at the crease.
+ */
+internal fun lastWicket(line: JsonElement?): LastWicket? {
+    val ps = line.at("partnerships").list()
+    val current = ps.lastOrNull() ?: return null
+    if (ps.size < 2 || current.at("fowType").text() == "out") return null
+    val prev = ps[ps.size - 2]
+    val inNow = current.at("batsmen").list().map { it.at("athlete").at("displayName").text() }.toSet()
+    val out = prev.at("batsmen").list().firstOrNull { it.at("athlete").at("displayName").text() !in inNow } ?: return null
+    val end = prev.at("end")
+    return LastWicket(
+        out.at("athlete").at("displayName").text(), out.at("runs").int(), out.at("balls").int(),
+        "${end.at("runs").int()}/${end.at("wickets").int()} (${end.at("overs").text()} Ov)",
+    )
+}
+
+/** Reviews remaining per side, from the newest line score of each competitor that carries them. */
+internal fun reviewsLeft(comp: JsonElement?): List<TeamReviews> =
+    comp.at("competitors").list().mapNotNull { c ->
+        val r = c.at("linescores").list().lastOrNull { it.at("reviews").at("remaining").text().isNotBlank() }
+            ?.at("reviews") ?: return@mapNotNull null
+        val left = r.at("remaining").int()
+        val permitted = r.at("reviewsPermitted").int().takeIf { it > 0 } ?: left
+        TeamReviews(c.at("team").at("abbreviation").text().ifBlank { c.at("team").at("displayName").text() }, left, permitted)
+    }
 
 private fun parseMatchcards(root: JsonElement): List<Innings> {
     val cards = root.at("matchcards").list()
@@ -429,10 +535,13 @@ private fun parseRosterInnings(root: JsonElement): List<Innings> {
                         .flatMap { it.at("stats").list() }
                         .associate { it.at("name").text() to it.at("displayValue").text() }
                     if (st["batted"] == "1") {
+                        // The full "c Smith b Ravindra" sits under statistics.batting.outDetails; the
+                        // card in the stats is only the code ("c"), and blank for a bowled batter.
+                        val outText = line.at("statistics").at("batting").at("outDetails").at("shortText").text().trim()
                         bats += Bat(
                             number, team, st["battingPosition"]?.toIntOrNull() ?: Int.MAX_VALUE,
                             BattingRow(
-                                name, st["dismissalCard"].orEmpty(), st["runs"].orEmpty(),
+                                name, outText.ifBlank { st["dismissalCard"].orEmpty() }, st["runs"].orEmpty(),
                                 st["ballsFaced"].orEmpty(), st["fours"].orEmpty(), st["sixes"].orEmpty(),
                             ),
                         )

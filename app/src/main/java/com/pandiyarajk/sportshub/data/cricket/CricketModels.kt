@@ -1,5 +1,8 @@
 // Author: Pandiyaraj Karuppasamy
 // Date: Oct-17-2026
+// Modified: Nov-22-2026 (partnership overs and rate, last bat, fall of wicket)
+// Modified: Nov-22-2026 (batting and bowling style on rows)
+// Modified: Nov-22-2026 (partnership and DRS reviews on the live panel)
 // Modified: Nov-22-2026 (session: day and session of a Test)
 
 package com.pandiyarajk.sportshub.data.cricket
@@ -60,6 +63,8 @@ data class BattingRow(
     val balls: String,
     val fours: String,
     val sixes: String,
+    /** Batting hand as Cricinfo writes it, "lhb" or "rhb"; blank when the feed has none. */
+    val style: String = "",
 )
 
 data class BowlingRow(
@@ -69,6 +74,8 @@ data class BowlingRow(
     val runs: String,
     val wickets: String,
     val economy: String,
+    /** Bowling style such as "rf", "rmf" or "ob"; blank when the feed has none. */
+    val style: String = "",
 )
 
 data class Innings(
@@ -90,12 +97,12 @@ fun twoPlaces(x: Double): String =
     String.format(java.util.Locale.US, "%.2f", kotlin.math.floor(x * 100 + 1e-9) / 100)
 
 /** A batter at the crease, as Cricinfo's live panel shows them. */
-data class LiveBatter(val name: String, val runs: Int, val balls: Int, val fours: Int, val sixes: Int, val onStrike: Boolean) {
+data class LiveBatter(val name: String, val runs: Int, val balls: Int, val fours: Int, val sixes: Int, val onStrike: Boolean, val style: String = "") {
     val strikeRate: String get() = if (balls == 0) "-" else twoPlaces(runs * 100.0 / balls)
 }
 
 /** A bowler in the current spell. */
-data class LiveBowler(val name: String, val overs: String, val maidens: Int, val conceded: Int, val wickets: Int, val balls: Int) {
+data class LiveBowler(val name: String, val overs: String, val maidens: Int, val conceded: Int, val wickets: Int, val balls: Int, val style: String = "") {
     val economy: String get() = if (balls == 0) "-" else twoPlaces(conceded * 6.0 / balls)
 }
 
@@ -115,7 +122,31 @@ data class LivePanel(
     val recentOvers: Int,
     /** The current over's balls, oldest first: "0", "1", "4", "W", "1wd". */
     val thisOver: List<String>,
+    /** The unbroken pair's partnership, or null when none is on (a wicket just fell, or no data). */
+    val partnership: Partnership? = null,
+    /** DRS reviews left per side, such as "NZ 3, IND 2"; empty when the feed has none. */
+    val reviews: List<TeamReviews> = emptyList(),
+    /** A Test's minimum overs left in the day, such as "39.0"; blank in limited overs or when unknown. */
+    val minOversLeft: String = "",
+    /** The last batter out with his score, such as "Tom Latham 0 (2b)"; blank when none or unknown. */
+    val lastBat: String = "",
+    /** That batter's name alone, so the scorecard's own figures can replace the partnership's. */
+    val lastBatName: String = "",
+    /** Fall of the last wicket, such as "0/1 (0.2 Ov)". */
+    val fow: String = "",
 )
+
+/** The current pair's stand: runs and balls faced by both. */
+data class Partnership(
+    val runs: Int,
+    val balls: Int,
+    /** Overs the stand has lasted, as the feed writes them ("10.2"); blank when absent. */
+    val overs: String = "",
+    /** The stand's run rate as the feed gives it ("3.09"); blank when absent. */
+    val runRate: String = "",
+)
+
+data class TeamReviews(val team: String, val remaining: Int, val permitted: Int = remaining)
 
 data class Scorecard(
     val innings: List<Innings>,
