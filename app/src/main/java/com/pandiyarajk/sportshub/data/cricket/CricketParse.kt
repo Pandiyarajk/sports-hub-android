@@ -1,5 +1,6 @@
 // Author: Pandiyaraj Karuppasamy
 // Date: Oct-17-2026
+// Modified: Nov-22-2026 (parse the Test day and session; teams ordered by the feed's order, batting first on top)
 // Modified: Oct-17-2026 (match label, city and winner; skip matches with no id;
 //   scorecard falls back to per-player roster stats when matchcards is empty; a rain delay or
 //   other interruption wins over the stale summary)
@@ -43,11 +44,13 @@ fun chaseLine(summary: String, scoreText: String): String {
 fun parseCricketHeader(body: String): List<CricketMatch> {
     val root = Http.json.parseToJsonElement(body)
     val leagues = root.at("sports").list().firstOrNull().at("leagues").list()
-    return leagues.flatMap { league ->
+    return leagues.filterNot { IndiaFilter.isHiddenLeague(it.at("name").text()) }.flatMap { league ->
         val leagueId = league.at("id").text()
         val leagueName = league.at("name").text()
         league.at("events").list().map { e ->
-            val teams = e.at("competitors").list().map { c ->
+            // The feed's `order` puts the side that batted first on top, as Cricinfo does; the list
+            // itself is home then away. A missing order (0) keeps the feed position (stable sort).
+            val teams = e.at("competitors").list().sortedBy { c -> c.at("order").int().takeIf { it > 0 } ?: Int.MAX_VALUE }.map { c ->
                 CricketTeam(
                     name = c.at("displayName").text(),
                     abbr = c.at("abbreviation").text(),
@@ -81,6 +84,7 @@ fun parseCricketHeader(body: String): List<CricketMatch> {
                 isIndia = IndiaFilter.isIndia(leagueName, teams),
                 label = e.at("title").text().removeSuffix(" (D/N)").trim(),
                 city = location.substringAfterLast(", ").trim(),
+                session = full.at("session").text().replace(Regex("""\s+"""), " ").trim(),
             )
         }
         // The id keys every list row; two blank ids would be a duplicate key and crash the list.

@@ -124,16 +124,17 @@ fun TeamRow(team: CricketTeam, dimmed: Boolean = false) {
             overflow = TextOverflow.Ellipsis,
             modifier = Modifier.weight(1f),
         )
-        Column(horizontalAlignment = Alignment.End) {
-            Text(team.headline, style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.Bold, color = color)
-            if (team.detail.isNotBlank()) {
-                Text(
-                    team.detail,
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
+        // Overs sit to the left of the score on the same line, as on Cricinfo: (29 ov) 72/1.
+        if (team.detail.isNotBlank()) {
+            Text(
+                team.detail,
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+            )
+            Spacer(Modifier.width(8.dp))
         }
+        Text(team.headline, style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.Bold, color = color, maxLines = 1)
     }
 }
 
@@ -143,6 +144,8 @@ fun TeamRow(team: CricketTeam, dimmed: Boolean = false) {
  */
 fun statusLine(m: CricketMatch, now: ZonedDateTime = ZonedDateTime.now()): String = when (m.state) {
     MatchState.UPCOMING -> startsIn(m.startIso, now).ifBlank { m.status }
+    // A live Test leads with its day and session: "Day 4 Session 2 · New Zealand trail by 352 runs".
+    MatchState.LIVE -> listOf(m.session, m.status).filter { it.isNotBlank() }.joinToString(" · ")
     else -> m.status
 }
 

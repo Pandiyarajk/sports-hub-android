@@ -41,6 +41,9 @@ Multi-sport scores for Android, one tab per sport.
 - **Live panel** above the scorecard while a match is on, as on Cricinfo: current and required run rate,
   the last 5 overs, the two batters (striker starred, R B 4s 6s SR), the two bowlers (O M R W Econ) and
   this over's balls.
+- **Test day and session** ("Day 4 Session 2") lead the status line of a live Test. The side that batted
+  first is listed on top, with its overs to the left of the score, as on Cricinfo.
+- **Pakistan domestic leagues** (Quaid-e-Azam Trophy and the like) are not listed.
 - **Rain delays and other stops** ("Match delayed by rain", stumps, innings breaks) show on the card.
 - Auto refresh: every 30 s while a match is live (15, 30 or 60 s in Settings), every 5 min otherwise, and
   pull to refresh at any time.

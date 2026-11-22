@@ -1,6 +1,6 @@
 // Author: Pandiyaraj Karuppasamy
 // Date: Oct-17-2026
-// Modified: Oct-31-2026 (isInternational)
+// Modified: Nov-22-2026 (session: day and session of a Test)
 
 package com.pandiyarajk.sportshub.data.cricket
 
@@ -35,6 +35,8 @@ data class CricketMatch(
     val label: String = "",
     /** The city, such as Bengaluru, or the ground name when the feed gives no city. */
     val city: String = "",
+    /** A Test's day and session as the feed gives it, such as "Day 4  Session 2"; blank for limited overs. */
+    val session: String = "",
 ) {
     /** 5th T20I . Bengaluru, as the card header shows it. */
     val labelAndCity: String get() = listOf(label, city).filter { it.isNotBlank() }.joinToString(" · ")
