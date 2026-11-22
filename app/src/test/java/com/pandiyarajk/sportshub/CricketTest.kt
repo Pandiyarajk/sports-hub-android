@@ -103,6 +103,17 @@ class IndiaFilterTest {
     }
 }
 
+class HiddenLeagueTest {
+    @Test
+    fun `Pakistan domestic leagues are hidden and international ones are not`() {
+        assertEquals(true, IndiaFilter.isHiddenLeague("Quaid-e-Azam Trophy Gold 2026/27"))
+        assertEquals(true, IndiaFilter.isHiddenLeague("Quaid-e-Azam Trophy Silver League 2026/27"))
+        assertEquals(true, IndiaFilter.isHiddenLeague("SLC Major League Tournament Group A"))
+        assertEquals(false, IndiaFilter.isHiddenLeague("India tour of New Zealand 2026/27"))
+        assertEquals(false, IndiaFilter.isHiddenLeague("Sheffield Shield"))
+    }
+}
+
 class CricketFeedParseTest {
     private val matches = parseCricketHeader(fixture("cricket_header.json"))
 

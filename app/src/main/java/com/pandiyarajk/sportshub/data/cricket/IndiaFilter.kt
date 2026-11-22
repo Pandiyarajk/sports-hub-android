@@ -1,6 +1,7 @@
 // Author: Pandiyaraj Karuppasamy
 // Date: Oct-17-2026
 // Modified: Oct-31-2026 (international matches ahead of club leagues)
+// Modified: Nov-22-2026 (isHiddenLeague: Pakistan domestic leagues are not listed)
 // Modified: Nov-14-2026 (isIndiaTeam: alerts follow the India team only, not Indian leagues)
 
 package com.pandiyarajk.sportshub.data.cricket
@@ -15,6 +16,14 @@ object IndiaFilter {
         "\\bIndia(n)?\\b|\\bIPL\\b|\\bWPL\\b|Ranji|Vijay Hazare|Mushtaq Ali|Duleep|Irani",
         RegexOption.IGNORE_CASE,
     )
+
+    /** Pakistan's domestic leagues and the SLC (Sri Lanka club) tournament, which the app hides. */
+    private val pakistanDomestic = Regex(
+        "\\bSLC\\b|Quaid-?e-?Azam|Pentangular|National T20|Champions (One-Day|Cup|T20)|Pakistan Cup",
+        RegexOption.IGNORE_CASE,
+    )
+
+    fun isHiddenLeague(league: String): Boolean = pakistanDomestic.containsMatchIn(league)
 
     /** The India national side (men, women, A, Under-19) is one of the teams. League names do not count. */
     fun isIndiaTeam(teams: List<CricketTeam>): Boolean =
