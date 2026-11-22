@@ -227,6 +227,11 @@ class HiddenLeagueTest {
         assertEquals(true, IndiaFilter.isHiddenLeague("Quaid-e-Azam Trophy Gold 2026/27"))
         assertEquals(true, IndiaFilter.isHiddenLeague("Quaid-e-Azam Trophy Silver League 2026/27"))
         assertEquals(true, IndiaFilter.isHiddenLeague("SLC Major League Tournament Group A"))
+        assertEquals(true, IndiaFilter.isHiddenLeague("CSA 4-Day Series Division 1"))
+        assertEquals(true, IndiaFilter.isHiddenLeague("CSA Women Pro50 Series 2026/27"))
+        assertEquals(true, IndiaFilter.isHiddenLeague("Plunket Shield"))
+        assertEquals(true, IndiaFilter.isHiddenLeague("Hong Kong Premier League One-Day Tournament"))
+        assertEquals(false, IndiaFilter.isHiddenLeague("Hong Kong v UAE Tri-Nation Series"))
         assertEquals(false, IndiaFilter.isHiddenLeague("India tour of New Zealand 2026/27"))
         assertEquals(false, IndiaFilter.isHiddenLeague("Sheffield Shield"))
     }
@@ -237,8 +242,9 @@ class CricketFeedParseTest {
 
     @Test
     fun `the captured header yields every match across every league`() {
-        assertEquals(16, matches.size)
-        assertEquals(10, matches.map { it.leagueId }.toSet().size)
+        // 16 events in 10 leagues in the capture; the CSA Women Pro50 league (2 events) is hidden.
+        assertEquals(14, matches.size)
+        assertEquals(9, matches.map { it.leagueId }.toSet().size)
     }
 
     @Test
