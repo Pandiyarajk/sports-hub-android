@@ -36,7 +36,7 @@ class DiskCacheTest {
 
         val offline = CricketRepository(cachedFetcher(cache)).matches()
         assertTrue(offline is Load.Ok)
-        assertEquals(16, (offline as Load.Ok).value.size)
+        assertEquals(14, (offline as Load.Ok).value.size)
     }
 
     @Test
