@@ -3,12 +3,25 @@
 
 package com.pandiyarajk.sportshub
 
+import com.pandiyarajk.sportshub.data.Http
+import com.pandiyarajk.sportshub.data.cricket.describeDismissal
+import com.pandiyarajk.sportshub.data.cricket.fullDismissal
+import com.pandiyarajk.sportshub.data.cricket.isFullDismissal
+import com.pandiyarajk.sportshub.data.cricket.playerStyles
+import com.pandiyarajk.sportshub.data.decodeEntities
 import com.pandiyarajk.sportshub.data.Load
 import com.pandiyarajk.sportshub.data.cricket.CricketMatch
 import com.pandiyarajk.sportshub.data.cricket.CricketRepository
 import com.pandiyarajk.sportshub.data.cricket.CricketTeam
 import com.pandiyarajk.sportshub.data.cricket.IndiaFilter
 import com.pandiyarajk.sportshub.data.cricket.MatchState
+import com.pandiyarajk.sportshub.data.cricket.LastWicket
+import com.pandiyarajk.sportshub.data.cricket.Partnership
+import com.pandiyarajk.sportshub.data.cricket.lastWicket
+import com.pandiyarajk.sportshub.data.cricket.TeamReviews
+import com.pandiyarajk.sportshub.data.cricket.currentPartnership
+import com.pandiyarajk.sportshub.data.cricket.minOversLeft
+import com.pandiyarajk.sportshub.data.cricket.reviewsLeft
 import com.pandiyarajk.sportshub.data.cricket.parseCricketHeader
 import com.pandiyarajk.sportshub.data.cricket.parseScorecard
 import kotlinx.coroutines.runBlocking
@@ -100,6 +113,111 @@ class IndiaFilterTest {
         val old = match("old", "L", MatchState.RESULT, listOf(team("C", "C")), "2026-10-10T10:00:00Z")
         val recent = match("recent", "L", MatchState.RESULT, listOf(team("D", "D")), "2026-10-16T10:00:00Z")
         assertEquals(listOf("recent", "old"), IndiaFilter.order(listOf(old, recent)).map { it.id })
+    }
+}
+
+class LastWicketTest {
+    private fun json(s: String) = Http.json.parseToJsonElement(s)
+
+    @Test
+    fun `the batter missing from the current pair is the one out, with the fall of wicket`() {
+        val line = json("""{"partnerships":[
+            {"fowType":"out","end":{"overs":"0.2","runs":0,"wickets":1},
+             "batsmen":[{"athlete":{"displayName":"Devon Conway"},"balls":"0","runs":"0"},
+                        {"athlete":{"displayName":"Tom Latham"},"balls":"2","runs":"0"}]},
+            {"fowType":"end of innings","runs":32,"overs":10.2,"runRate":3.09,
+             "batsmen":[{"athlete":{"displayName":"Devon Conway"},"balls":"28","runs":12},
+                        {"athlete":{"displayName":"Henry Nicholls"},"balls":"34","runs":20}]}]}""")
+        assertEquals(LastWicket("Tom Latham", 0, 2, "0/1 (0.2 Ov)"), lastWicket(line))
+        assertEquals(Partnership(32, 62, "10.2", "3.09"), currentPartnership(line))
+    }
+
+    @Test
+    fun `no last wicket for a first stand or when a wicket has just fallen`() {
+        assertEquals(null, lastWicket(json("""{"partnerships":[{"fowType":"end of innings","batsmen":[]}]}""")))
+        assertEquals(null, lastWicket(json("""{"partnerships":[{"fowType":"out"},{"fowType":"out"}]}""")))
+        assertEquals(null, lastWicket(null))
+    }
+}
+
+class PartnershipReviewsTest {
+    private fun json(s: String) = Http.json.parseToJsonElement(s)
+
+    @Test
+    fun `an unbroken pair gives runs and both batters' balls`() {
+        val line = json("""{"partnerships":[{"fowType":"out","runs":5,"batsmen":[]},
+            {"fowType":"end of innings","runs":24,"batsmen":[{"balls":"15"},{"balls":"26"}]}]}""")
+        assertEquals(Partnership(24, 41), currentPartnership(line))
+    }
+
+    @Test
+    fun `a partnership that ended in a wicket is not shown`() {
+        val line = json("""{"partnerships":[{"fowType":"out","runs":9,"batsmen":[{"balls":"3"}]}]}""")
+        assertEquals(null, currentPartnership(line))
+        assertEquals(null, currentPartnership(null))
+    }
+
+    @Test
+    fun `reviews left come from the newest line score that has them`() {
+        val comp = json("""{"competitors":[
+            {"team":{"abbreviation":"NZ"},"linescores":[{"reviews":{"remaining":2}},{"reviews":{"remaining":1}}]},
+            {"team":{"abbreviation":"IND"},"linescores":[{}]}]}""")
+        assertEquals(listOf(TeamReviews("NZ", 1, 1)), reviewsLeft(comp))
+    }
+}
+
+class PlayerStyleTest {
+    @Test
+    fun `roster athlete styles become lowercase hand and bowling style`() {
+        val root = Http.json.parseToJsonElement("""{"rosters":[{"roster":[
+            {"athlete":{"displayName":"Devon Conway","battingName":"DP Conway","style":[
+              {"shortDescription":"Lhb","type":"batting"},{"shortDescription":"Rm","type":"bowling"}]}},
+            {"athlete":{"displayName":"Jasprit Bumrah","style":[
+              {"shortDescription":"Rhb","type":"batting"},{"shortDescription":"Rf","type":"bowling"}]}},
+            {"athlete":{"displayName":"No Style"}}]}]}""")
+        val s = playerStyles(root)
+        assertEquals("lhb" to "rm", s["Devon Conway"])
+        assertEquals("lhb" to "rm", s["DP Conway"])
+        assertEquals("rhb" to "rf", s["Jasprit Bumrah"])
+        assertEquals(null, s["No Style"])
+    }
+}
+
+class FullDismissalTest {
+    @Test
+    fun `the feed's full text wins over a pieced together one`() {
+        assertEquals("c Smith b Ravindra", fullDismissal("X", "c Smith b Ravindra", mapOf("X" to "c Smith b Ravindra 85 (137m 89b)")))
+        assertEquals("b Smith", fullDismissal("X", "b Smith", emptyMap()))
+        assertEquals("c & b Ravindra", fullDismissal("X", "c & b Ravindra", emptyMap()))
+        assertEquals("st †Blundell b Phillips", fullDismissal("X", "st †Blundell b Phillips", emptyMap()))
+    }
+
+    @Test
+    fun `a bare code is still widened and is not a full dismissal`() {
+        assertEquals("caught", fullDismissal("X", "c", emptyMap()))
+        assertEquals(false, isFullDismissal("c"))
+        assertEquals(false, isFullDismissal("caught"))
+        assertEquals(true, isFullDismissal("c Smith b Ravindra"))
+        assertEquals(true, isFullDismissal("lbw b Henry"))
+    }
+}
+
+class EntityTest {
+    @Test
+    fun `a keeper's dagger entity becomes the dagger and still reads as the keeper`() {
+        assertEquals("c †Pant b Bumrah", decodeEntities("c &dagger;Pant b Bumrah"))
+        assertEquals("caught by Pant (keeper), bowled by Bumrah", describeDismissal(decodeEntities("c &dagger;Pant b Bumrah")))
+        assertEquals("stumped by Blundell, bowled by Phillips", describeDismissal(decodeEntities("st &dagger;Blundell b Phillips")))
+    }
+}
+
+class MinOversTest {
+    @Test
+    fun `only a Test with overs left shows min overs`() {
+        assertEquals("39.0", minOversLeft(true, "39.0"))
+        assertEquals("", minOversLeft(true, "0.0"))
+        assertEquals("", minOversLeft(false, "39.0"))
+        assertEquals("", minOversLeft(true, ""))
     }
 }
 
@@ -251,9 +369,12 @@ class ScorecardParseTest {
         val body = fixture("cricket_summary_wicket.json").replace("\"dismissal\": true", "\"dismissal\": false")
         val card = parseScorecard(body, known = mapOf("Abhishek Sharma" to "c Joseph b Paul"))
         assertEquals("c Joseph b Paul", card.innings.single().batting.first { it.name == "Abhishek Sharma" }.dismissal)
-        // And with nothing remembered, the code in words rather than a bare letter.
+        // Nothing remembered, but the roster carries the full text (statistics.batting.outDetails).
         val cold = parseScorecard(body)
-        assertEquals("caught", cold.innings.single().batting.first { it.name == "Abhishek Sharma" }.dismissal)
+        assertEquals("c Joseph b Paul", cold.innings.single().batting.first { it.name == "Abhishek Sharma" }.dismissal)
+        // And with that gone too, the code in words rather than a bare letter.
+        val bare = parseScorecard(body.replace("\"outDetails\"", "\"outDetailsGone\""))
+        assertEquals("caught", bare.innings.single().batting.first { it.name == "Abhishek Sharma" }.dismissal)
     }
 
     @Test
@@ -407,7 +528,10 @@ class CricketRepositoryTest {
     @Test
     fun `a wicket gone from the commentary window is filled from the play-by-play, once`() = runBlocking {
         // Live, Oct-17-2026: after a restart, Abhishek Sharma read only "caught".
-        val summaryWithoutWicketBall = fixture("cricket_summary_wicket.json").replace("\"dismissal\": true", "\"dismissal\": false")
+        // The roster's own full text is removed as well, so only the code is left to widen.
+        val summaryWithoutWicketBall = fixture("cricket_summary_wicket.json")
+            .replace("\"dismissal\": true", "\"dismissal\": false")
+            .replace("\"outDetails\"", "\"outDetailsGone\"")
         var pages = 0
         val repo = CricketRepository { req ->
             val url = req.url.toString()

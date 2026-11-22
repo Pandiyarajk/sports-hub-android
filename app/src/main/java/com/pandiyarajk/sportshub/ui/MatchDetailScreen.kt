@@ -1,5 +1,8 @@
 // Author: Pandiyaraj Karuppasamy
 // Date: Oct-17-2026
+// Modified: Nov-22-2026 (partnership detail, last bat, FOW)
+// Modified: Nov-22-2026 (batting and bowling style beside names)
+// Modified: Nov-22-2026 (partnership and reviews lines)
 // Modified: Nov-22-2026 (View commentary link)
 // Modified: Nov-22-2026 (innings expand and collapse, one open at a time)
 // Modified: Oct-17-2026 (raised cards; keeps the match list fresh while a live match is open;
@@ -42,7 +45,12 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.withStyle
+import androidx.compose.ui.unit.sp
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -137,6 +145,7 @@ private fun LivePanelCard(live: LivePanel) {
             val rates = buildList {
                 if (live.runRate.isNotBlank()) add("Current RR: ${live.runRate}")
                 if (live.requiredRate.isNotBlank()) add("Required RR: ${live.requiredRate}")
+                if (live.minOversLeft.isNotBlank()) add("Min. Ov. Rem: ${live.minOversLeft}")
                 if (live.recent.isNotBlank()) add("Last ${live.recentOvers} ov (RR): ${live.recent}")
             }
             if (rates.isNotEmpty()) {
@@ -146,7 +155,7 @@ private fun LivePanelCard(live: LivePanel) {
                 HorizontalDivider(Modifier.padding(vertical = 4.dp))
                 LiveLine("Batters", "R", "B", "4s", "6s", "SR", header = true)
                 live.batters.forEach { b ->
-                    LiveLine(b.name + if (b.onStrike) " *" else "", "${b.runs}", "${b.balls}", "${b.fours}", "${b.sixes}", b.strikeRate, bold = b.onStrike)
+                    LiveLine(b.name + if (b.onStrike) " *" else "", "${b.runs}", "${b.balls}", "${b.fours}", "${b.sixes}", b.strikeRate, bold = b.onStrike, style = b.style)
                 }
             }
             if (live.bowlers.isNotEmpty()) {
@@ -154,7 +163,36 @@ private fun LivePanelCard(live: LivePanel) {
                 LiveLine("Bowlers", "O", "M", "R", "W", "Econ", header = true)
                 live.bowlers.forEachIndexed { i, w ->
                     // The first is bowling this over.
-                    LiveLine(w.name + if (i == 0) " *" else "", w.overs, "${w.maidens}", "${w.conceded}", "${w.wickets}", w.economy, bold = i == 0)
+                    LiveLine(w.name + if (i == 0) " *" else "", w.overs, "${w.maidens}", "${w.conceded}", "${w.wickets}", w.economy, bold = i == 0, style = w.style)
+                }
+            }
+            if (live.partnership != null || live.reviews.isNotEmpty() || live.lastBat.isNotBlank()) {
+                HorizontalDivider(Modifier.padding(vertical = 4.dp))
+                live.partnership?.let { p ->
+                    val stand = buildString {
+                        append("Partnership: ${p.runs} runs")
+                        // Overs say the same as balls; balls only when the feed has no overs.
+                        if (p.overs.isNotBlank()) append(", ${p.overs} ov") else append(" (${p.balls} b)")
+                        if (p.runRate.isNotBlank()) append(" (RR ${p.runRate})")
+                    }
+                    Text(stand, style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.SemiBold)
+                }
+                if (live.lastBat.isNotBlank() || live.fow.isNotBlank()) {
+                    Text(
+                        listOfNotNull(
+                            live.lastBat.takeIf { it.isNotBlank() }?.let { "Last bat: $it" },
+                            live.fow.takeIf { it.isNotBlank() }?.let { "FOW: $it" },
+                        ).joinToString(" · "),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                if (live.reviews.isNotEmpty()) {
+                    Text(
+                        "DRS reviews left: " + live.reviews.joinToString(", ") { "${it.team} ${it.remaining} of ${it.permitted}" },
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
                 }
             }
             if (live.thisOver.isNotEmpty()) {
@@ -169,10 +207,10 @@ private fun LivePanelCard(live: LivePanel) {
 }
 
 @Composable
-private fun LiveLine(name: String, a: String, b: String, c: String, d: String, e: String, header: Boolean = false, bold: Boolean = false) {
+private fun LiveLine(name: String, a: String, b: String, c: String, d: String, e: String, header: Boolean = false, bold: Boolean = false, style: String = "") {
     val weight = if (header || bold) FontWeight.SemiBold else FontWeight.Normal
     Row(Modifier.fillMaxWidth().padding(vertical = 2.dp)) {
-        Text(name, style = MaterialTheme.typography.bodySmall, fontWeight = weight, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(3f))
+        Text(nameWithStyle(name, style), style = MaterialTheme.typography.bodySmall, fontWeight = weight, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(3f))
         Cell(a, weight)
         Cell(b, weight)
         Cell(c, weight)
@@ -225,7 +263,7 @@ private fun InningsCard(inn: Innings, expanded: Boolean, onToggle: () -> Unit) {
             TableLine("Batter", "R", "B", "4s", "6s", header = true)
             inn.batting.forEach { b ->
                 Column {
-                    TableLine(b.name, b.runs, b.balls, b.fours, b.sixes)
+                    TableLine(b.name, b.runs, b.balls, b.fours, b.sixes, style = b.style)
                     if (b.dismissal.isNotBlank()) {
                         Text(
                             b.dismissal,
@@ -241,18 +279,18 @@ private fun InningsCard(inn: Innings, expanded: Boolean, onToggle: () -> Unit) {
             if (inn.bowling.isNotEmpty()) {
                 HorizontalDivider(Modifier.padding(vertical = 4.dp))
                 TableLine("Bowler", "O", "M", "R", "W", header = true)
-                inn.bowling.forEach { w -> TableLine(w.name, w.overs, w.maidens, w.runs, w.wickets) }
+                inn.bowling.forEach { w -> TableLine(w.name, w.overs, w.maidens, w.runs, w.wickets, style = w.style) }
             }
         }
     }
 }
 
 @Composable
-private fun TableLine(name: String, a: String, b: String, c: String, d: String, header: Boolean = false) {
+private fun TableLine(name: String, a: String, b: String, c: String, d: String, header: Boolean = false, style: String = "") {
     Row(Modifier.fillMaxWidth().padding(vertical = 2.dp)) {
         val weight = if (header) FontWeight.SemiBold else FontWeight.Normal
         Text(
-            name,
+            nameWithStyle(name, style),
             style = MaterialTheme.typography.bodySmall,
             fontWeight = weight,
             maxLines = 1,
@@ -263,6 +301,18 @@ private fun TableLine(name: String, a: String, b: String, c: String, d: String, 
         Cell(b, weight)
         Cell(c, weight)
         Cell(d, weight)
+    }
+}
+
+/** A name followed by its batting hand or bowling style in small muted type, as Cricinfo does ("Conway lhb"). */
+@Composable
+private fun nameWithStyle(name: String, style: String): AnnotatedString {
+    if (style.isBlank()) return AnnotatedString(name)
+    val muted = MaterialTheme.colorScheme.onSurfaceVariant
+    return buildAnnotatedString {
+        append(name)
+        append(" ")
+        withStyle(SpanStyle(color = muted, fontSize = 10.sp, fontWeight = FontWeight.Normal)) { append(style) }
     }
 }
 
