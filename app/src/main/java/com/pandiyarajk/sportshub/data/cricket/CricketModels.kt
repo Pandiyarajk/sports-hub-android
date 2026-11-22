@@ -37,6 +37,8 @@ data class CricketMatch(
     val city: String = "",
     /** A Test's day and session as the feed gives it, such as "Day 4  Session 2"; blank for limited overs. */
     val session: String = "",
+    /** The match page on espn.in (scores and commentary), opened in the browser; blank when the feed has none. */
+    val link: String = "",
 ) {
     /** 5th T20I . Bengaluru, as the card header shows it. */
     val labelAndCity: String get() = listOf(label, city).filter { it.isNotBlank() }.joinToString(" · ")

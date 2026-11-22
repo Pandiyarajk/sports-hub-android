@@ -17,9 +17,9 @@ object IndiaFilter {
         RegexOption.IGNORE_CASE,
     )
 
-    /** Pakistan's domestic leagues (regional and departmental sides), which the app hides. */
+    /** Pakistan's domestic leagues and the SLC (Sri Lanka club) tournament, which the app hides. */
     private val pakistanDomestic = Regex(
-        "Quaid-?e-?Azam|Pentangular|National T20|Champions (One-Day|Cup|T20)|Pakistan Cup",
+        "\\bSLC\\b|Quaid-?e-?Azam|Pentangular|National T20|Champions (One-Day|Cup|T20)|Pakistan Cup",
         RegexOption.IGNORE_CASE,
     )
 

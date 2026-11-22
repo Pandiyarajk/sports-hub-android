@@ -84,6 +84,7 @@ fun parseCricketHeader(body: String): List<CricketMatch> {
                 isIndia = IndiaFilter.isIndia(leagueName, teams),
                 label = e.at("title").text().removeSuffix(" (D/N)").trim(),
                 city = location.substringAfterLast(", ").trim(),
+                link = e.at("link").text(),
                 session = full.at("session").text().replace(Regex("""\s+"""), " ").trim(),
             )
         }

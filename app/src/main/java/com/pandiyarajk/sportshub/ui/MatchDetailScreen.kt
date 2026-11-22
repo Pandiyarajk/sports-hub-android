@@ -1,11 +1,25 @@
 // Author: Pandiyaraj Karuppasamy
 // Date: Oct-17-2026
+// Modified: Nov-22-2026 (View commentary link)
+// Modified: Nov-22-2026 (innings expand and collapse, one open at a time)
 // Modified: Oct-17-2026 (raised cards; keeps the match list fresh while a live match is open;
 //   live panel with batters, bowlers, rates and this over)
 
 package com.pandiyarajk.sportshub.ui
 
 import androidx.compose.foundation.background
+import android.content.Intent
+import android.net.Uri
+import androidx.compose.foundation.clickable
+import androidx.compose.material3.TextButton
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.KeyboardArrowUp
+import androidx.compose.material3.Icon
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -77,6 +91,17 @@ fun MatchDetailScreen(match: CricketMatch, vm: SportsViewModel) {
                 if (match.venue.isNotBlank()) {
                     Text(match.venue, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
+                if (match.link.startsWith("https://")) {
+                    val context = LocalContext.current
+                    // The system browser opens it in a new tab; the app itself never requests the page.
+                    TextButton(
+                        onClick = {
+                            runCatching {
+                                context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(match.link)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                            }
+                        },
+                    ) { Text("View commentary") }
+                }
             }
         }
         item(key = "scorecard") {
@@ -90,7 +115,12 @@ fun MatchDetailScreen(match: CricketMatch, vm: SportsViewModel) {
                     if (card.innings.isEmpty()) {
                         Text("The scorecard is not available yet.", style = MaterialTheme.typography.bodyMedium)
                     } else {
-                        card.innings.forEach { InningsCard(it) }
+                        // A Test has four innings: one open at a time, the latest by default.
+                        var open by rememberSaveable(match.id) { mutableStateOf<Int?>(null) }
+                        val shown = open ?: card.innings.lastIndex
+                        card.innings.forEachIndexed { i, inn ->
+                            InningsCard(inn, expanded = i == shown, onToggle = { open = if (i == shown) -1 else i })
+                        }
                     }
                 }
             }
@@ -168,10 +198,14 @@ private fun BallChip(label: String) {
 }
 
 @Composable
-private fun InningsCard(inn: Innings) {
+private fun InningsCard(inn: Innings, expanded: Boolean, onToggle: () -> Unit) {
     Card(colors = cardColors()) {
         Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+            Row(
+                Modifier.fillMaxWidth().clickable(onClick = onToggle),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
                 Text(
                     "${inn.team}, innings ${inn.number}",
                     style = MaterialTheme.typography.titleSmall,
@@ -181,7 +215,12 @@ private fun InningsCard(inn: Innings) {
                     overflow = TextOverflow.Ellipsis,
                 )
                 Text("${inn.runs} ${inn.total}".trim(), style = MaterialTheme.typography.bodySmall)
+                Icon(
+                    if (expanded) Icons.Filled.KeyboardArrowUp else Icons.Filled.KeyboardArrowDown,
+                    contentDescription = if (expanded) "Collapse innings" else "Expand innings",
+                )
             }
+            if (!expanded) return@Column
             HorizontalDivider()
             TableLine("Batter", "R", "B", "4s", "6s", header = true)
             inn.batting.forEach { b ->
