@@ -85,6 +85,14 @@ Multi-sport scores for Android, one tab per sport.
   the network answers.
 - A failed refresh keeps the scores on screen and says so: "Offline. Showing scores from 17 Oct, 6:25 pm".
 - Every screen shows when its data was last updated.
+- The "Offline" note also appears when the phone is online but the network blocks ESPN (some office
+  Wi-Fi filters sports sites). Switch to mobile data and pull to refresh.
+
+### Landscape
+
+- Turn the phone on its side and the home screen shows **two match tiles a row**, with the tabs and
+  Settings in a slim rail down the side instead of the top and bottom bars.
+- Nothing is drawn under the camera cutout or the navigation bar, whichever side they are on.
 
 ### Adding a sport
 
